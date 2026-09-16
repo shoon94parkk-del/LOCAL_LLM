@@ -267,7 +267,9 @@ async function request(url,body){
 async function runAgent(button){
  const question=document.getElementById('q').value.trim(); if(!question)return;
  button.disabled=true; const box=document.getElementById('agentResult');box.textContent='계획 및 도구 실행 중...';
- try {const d=await request('/api/agent/run',{question,skill:document.getElementById('skill').value||null});currentId=d.conversation_id||null;
+ try {const plan=await request('/api/agent/plan',{question,skill:document.getElementById('skill').value||null});
+ box.textContent='Plan 단계:\n'+plan.steps.map((x,i)=>(i+1)+'. '+x).join('\n')+'\n\n실행 중...';
+ const d=await request('/api/agent/run',{question,skill:document.getElementById('skill').value||null});currentId=d.conversation_id||null;
  box.textContent='실행 상태: '+d.status+' / ID: '+d.id+'\n'+d.steps.map((s,i)=>'단계 '+(i+1)+': '+JSON.stringify(s)).join('\n')+'\n'+(d.answer||d.error||'');
  if(d.status==='awaiting_approval'){
    const approve=document.createElement('button'); approve.textContent='이 작업 승인'; approve.onclick=()=>continueAgent(d.id,'approve');

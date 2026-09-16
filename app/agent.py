@@ -38,6 +38,16 @@ def parse_action(raw: str) -> Action:
 
 class Agent:
     MUTATING_TOOLS = {'write_file', 'write_report', 'create_directory', 'run_command', 'git_commit'}
+
+    @staticmethod
+    def error_category(exc):
+        if isinstance(exc, (json.JSONDecodeError, ValueError)):
+            return 'model_or_validation'
+        if isinstance(exc, (FileNotFoundError, PermissionError, OSError)):
+            return 'filesystem'
+        if isinstance(exc, subprocess.TimeoutExpired):
+            return 'command_timeout'
+        return 'runtime'
     def __init__(self, cfg, memory, retriever, llm):
         self.cfg, self.memory, self.retriever, self.llm = cfg, memory, retriever, llm
         self.root = Path(cfg.agent_workspace).resolve()
@@ -192,7 +202,10 @@ class Agent:
                         run['steps'][-1]['error'] = '도구 결과 검증 실패'
                     run.pop('approved_action', None)
                 except (ValueError, KeyError, OSError) as exc:
-                    run['steps'].append({'error': str(exc)[:1000]})
+                    category = self.error_category(exc)
+                    retries = sum(1 for step in run['steps'] if step.get('retry_category') == category)
+                    run['steps'].append({'error': str(exc)[:1000], 'retry_category': category, 'retry_number': retries + 1,
+                                         'retry_limit': 2 if category in {'model_or_validation', 'filesystem'} else 1})
                 self.save(run)
             else:
                 run['status'] = 'step_limit'
