@@ -5,7 +5,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     app_name: str = "LOCAL_LLM Memory Agent"
     db_path: str = "data/memory.db"
-    glm_mode: str = "mock"  # mock | playwright
+    glm_mode: str = "mock"  # mock | playwright | browser_bridge
     glm_url: str = ""
     glm_input_selector: str = "textarea"
     glm_submit_selector: str = ""
@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     browser_bridge_token: str = ""
     skills_dir: str = "skills"
     agent_allowed_roots: list[str] = []
-    agent_require_approval: bool = False
+    agent_require_approval: bool = True
     agent_command_timeout: int = 30
 
     model_config = SettingsConfigDict(env_file=".env", env_prefix="LOCAL_LLM_", extra="ignore")
