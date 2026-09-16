@@ -1,5 +1,11 @@
 class MockLLM:
     async def generate(self, prompt: str) -> str:
+        if "[AGENT_REQUEST]" in prompt:
+            import json
+            payload = json.loads(prompt[prompt.index('{"goal":'):])
+            if not payload['steps']:
+                return json.dumps({"plan": "관련 기억을 검색합니다", "tool": "memory_search", "arguments": {"query": payload['goal']}})
+            return json.dumps({"tool": "finish", "arguments": {"answer": "[MOCK] 기억 검색 도구 실행을 완료했습니다. 실제 분석에는 회사 GLM 연결이 필요합니다."}})
         if "[REFLECTION_REQUEST]" in prompt:
             return (
                 '{"rules":[{"rule":"실제 해결/실패 결과를 함께 비교해 다음 대응 조건을 결정한다.",'

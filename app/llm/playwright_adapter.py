@@ -15,8 +15,13 @@ class PlaywrightGLM:
 
     def __init__(self, settings: Settings):
         self.settings = settings
+        self.lock = asyncio.Lock()
 
     async def generate(self, prompt: str) -> str:
+        async with self.lock:
+            return await self._generate(prompt)
+
+    async def _generate(self, prompt: str) -> str:
         if not self.settings.glm_url:
             raise RuntimeError("LOCAL_LLM_GLM_URL is required in playwright mode")
 
@@ -46,26 +51,29 @@ class PlaywrightGLM:
                 else:
                     await input_box.press("Enter")
 
-                return await self._wait_for_new_response(responses, before_count)
+                return await self._wait_for_new_response(responses, before_count, page)
             finally:
                 await context.close()
 
-    async def _wait_for_new_response(self, responses, before_count: int) -> str:
+    async def _wait_for_new_response(self, responses, before_count: int, page=None) -> str:
         deadline = time.monotonic() + self.settings.glm_timeout_ms / 1000
         previous = ""
-        stable_hits = 0
+        stable_since = time.monotonic()
 
         while time.monotonic() < deadline:
             count = await responses.count()
             if count > before_count:
                 text = (await responses.nth(count - 1).inner_text()).strip()
                 if text:
-                    if text == previous:
-                        stable_hits += 1
-                    else:
+                    if text != previous:
                         previous = text
-                        stable_hits = 0
-                    if stable_hits >= 2:
+                        stable_since = time.monotonic()
+                    generating = False
+                    if self.settings.glm_stop_selector and page is not None:
+                        generating = await page.locator(self.settings.glm_stop_selector).last.is_visible()
+                    if generating:
+                        stable_since = time.monotonic()
+                    elif time.monotonic() - stable_since >= self.settings.glm_stable_seconds:
                         return text
             await asyncio.sleep(0.8)
 

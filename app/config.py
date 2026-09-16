@@ -14,6 +14,15 @@ class Settings(BaseSettings):
     glm_headless: bool = False
     glm_timeout_ms: int = 120000
     top_k_context: int = 5
+    embedding_mode: str = "disabled"
+    embedding_model_path: str = ""
+    embedding_device: str = "cpu"
+    embedding_query_prefix: str = ""
+    embedding_document_prefix: str = ""
+    agent_workspace: str = "data/workspace"
+    agent_max_steps: int = 8
+    glm_stop_selector: str = ""
+    glm_stable_seconds: float = 5.0
 
     model_config = SettingsConfigDict(env_file=".env", env_prefix="LOCAL_LLM_", extra="ignore")
 

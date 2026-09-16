@@ -1,0 +1,2 @@
+# Optional: install only when using a local SentenceTransformers model folder.
+sentence-transformers>=3.4,<6

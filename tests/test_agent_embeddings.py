@@ -1,0 +1,125 @@
+import asyncio
+import json
+import pytest
+from fastapi.testclient import TestClient
+from app.agent import Agent
+from app.config import Settings
+from app.db import Database
+from app.memory import MemoryStore
+from app.embeddings import HybridRetriever, LocalEmbeddings, cosine
+from app.main import create_app
+
+
+def config(tmp_path, **kwargs):
+    return Settings(_env_file=None, db_path=str(tmp_path/'db'), agent_workspace=str(tmp_path/'workspace'), **kwargs)
+
+
+class SequenceLLM:
+    def __init__(self, responses): self.responses = iter(responses)
+    async def generate(self, prompt): return next(self.responses)
+
+
+def test_mock_agent_persists_and_feedback(tmp_path):
+    client = TestClient(create_app(config(tmp_path)))
+    run = client.post('/api/agent/run', json={'question': '압력 원인 조사'}).json()
+    assert run['status'] == 'completed'
+    assert run['steps'][0]['action']['tool'] == 'memory_search'
+    assert client.get('/api/agent/runs/'+run['id']).json() == run
+    assert client.post('/api/feedback/'+str(run['conversation_id']), json={'status':'resolved'}).status_code == 200
+
+
+def test_agent_recovers_and_writes_report(tmp_path):
+    cfg=config(tmp_path)
+    memory=MemoryStore(Database(cfg.db_path))
+    actions=[{'tool':'read_file','arguments':{'path':'../private.txt'}},
+             {'tool':'write_report','arguments':{'content':'# Evidence\nNo data'}},
+             {'tool':'finish','arguments':{'answer':'보고서 생성됨'}}]
+    agent=Agent(cfg,memory,HybridRetriever(memory),SequenceLLM(map(json.dumps,actions)))
+    result=asyncio.run(agent.run('보고서'))
+    assert result['status']=='completed'
+    assert 'error' in result['steps'][0]
+    assert (agent.root/result['steps'][1]['result']['artifact']).read_text(encoding='utf-8').startswith('# Evidence')
+    for name in ['../outside','.env',str(tmp_path/'outside')]:
+        with pytest.raises(ValueError): agent.path(name)
+
+
+def test_step_limit_and_malformed_json(tmp_path):
+    cfg=config(tmp_path,agent_max_steps=2)
+    memory=MemoryStore(Database(cfg.db_path))
+    agent=Agent(cfg,memory,HybridRetriever(memory),SequenceLLM(['not json','{"tool":"shell"}']))
+    result=asyncio.run(agent.run('test'))
+    assert result['status']=='step_limit'
+    assert len(result['steps'])==2
+    assert all('error' in s for s in result['steps'])
+
+
+class Encoder:
+    identity='test-v1'
+    def encode(self,texts,query=False):
+        return [[1.,0.] if ('압력' in t or 'pressure' in t) else [0.,1.] for t in texts]
+
+
+def test_semantic_retrieval_updates_existing_feedback(tmp_path):
+    memory=MemoryStore(Database(str(tmp_path/'db')))
+    conversation=memory.add_conversation('압력 이상','조정 필요')
+    memory.add_conversation('온도','확인')
+    retriever=HybridRetriever(memory,Encoder())
+    assert retriever.search('pressure')[0]['source_id']==conversation
+    assert retriever.reindex()==0
+    memory.set_feedback(conversation,'failed','실패')
+    assert retriever.reindex()==1
+    memory.set_feedback(conversation,'resolved','성공')
+    assert retriever.reindex()==1
+    assert retriever.reindex(force=True)==3
+
+
+def test_embedding_path_and_dimensions(tmp_path):
+    with pytest.raises(ValueError): LocalEmbeddings(config(tmp_path,embedding_model_path=str(tmp_path/'missing'))).encode(['test'])
+    with pytest.raises(ValueError): cosine([1.],[1.,2.])
+    with pytest.raises(ValueError): cosine([float('nan')],[1.])
+    client=TestClient(create_app(config(tmp_path)))
+    assert client.post('/api/diagnostics/embedding').json()['ok'] is False
+    assert client.post('/api/embeddings/reindex').status_code==400
+
+
+def test_glm_does_not_return_while_generating(tmp_path, monkeypatch):
+    from app.llm import playwright_adapter as module
+    ticks = [0.0]
+    monkeypatch.setattr(module.time, 'monotonic', lambda: ticks[0])
+    async def sleep(seconds): ticks[0] += seconds
+    monkeypatch.setattr(module.asyncio, 'sleep', sleep)
+    class Responses:
+        async def count(self): return 1
+        def nth(self, index): return self
+        async def inner_text(self): return 'complete'
+    class Stop:
+        @property
+        def last(self): return self
+        async def is_visible(self): return ticks[0] < 3
+    class Page:
+        def locator(self, selector): return Stop()
+    cfg=config(tmp_path,glm_stop_selector='button.stop',glm_stable_seconds=1,glm_timeout_ms=8000)
+    result=asyncio.run(module.PlaywrightGLM(cfg)._wait_for_new_response(Responses(),0,Page()))
+    assert result=='complete' and ticks[0]>=3.4
+    ticks[0]=0
+    with pytest.raises(TimeoutError):
+        asyncio.run(module.PlaywrightGLM(cfg)._wait_for_new_response(Responses(),1,Page()))
+
+
+def test_model_load_is_local_only(tmp_path, monkeypatch):
+    import sys
+    import types
+    calls={}
+    class Model:
+        def __init__(self,path,**kwargs): calls.update(kwargs)
+        def encode(self,texts,**kwargs):
+            calls['texts']=texts
+            class Values:
+                def tolist(self): return [[1.,0.]]
+            return Values()
+    monkeypatch.setitem(sys.modules,'sentence_transformers',types.SimpleNamespace(SentenceTransformer=Model))
+    cfg=config(tmp_path,embedding_model_path=str(tmp_path),embedding_query_prefix='query: ')
+    assert LocalEmbeddings(cfg).encode(['hello'],query=True)==[[1.,0.]]
+    assert calls['local_files_only'] is True
+    assert calls['trust_remote_code'] is False
+    assert calls['texts']==['query: hello']

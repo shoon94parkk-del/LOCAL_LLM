@@ -1,4 +1,7 @@
+import asyncio
 from fastapi import FastAPI, HTTPException
+from app.agent import Agent
+from app.embeddings import LocalEmbeddings, HybridRetriever
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
@@ -11,7 +14,7 @@ from app.reflection import run_reflection
 
 
 class ChatRequest(BaseModel):
-    question: str = Field(min_length=1)
+    question: str = Field(min_length=1, max_length=12000)
 
 
 class FeedbackRequest(BaseModel):
@@ -30,8 +33,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     cfg.ensure_paths()
     db = Database(cfg.db_path)
     memory = MemoryStore(db)
+    if cfg.glm_mode not in {"mock", "playwright"}:
+        raise ValueError("Unknown GLM mode")
+    if cfg.embedding_mode not in {"disabled", "local"}:
+        raise ValueError("Unknown embedding mode")
+    retriever = HybridRetriever(memory, LocalEmbeddings(cfg) if cfg.embedding_mode == "local" else None)
     llm = PlaywrightGLM(cfg) if cfg.glm_mode.lower() == "playwright" else MockLLM()
 
+    agent = Agent(cfg, memory, retriever, llm)
     app = FastAPI(title=cfg.app_name)
     app.state.settings = cfg
     app.state.memory = memory
@@ -43,9 +52,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/chat")
     async def chat(payload: ChatRequest) -> dict:
-        memories = memory.search(payload.question, cfg.top_k_context)
-        prompt = build_prompt(payload.question, memories)
-        answer = await llm.generate(prompt)
+        try:
+            memories = await asyncio.to_thread(retriever.search, payload.question, cfg.top_k_context)
+            prompt = build_prompt(payload.question, memories)
+            answer = await llm.generate(prompt)
+        except Exception as exc:
+            raise HTTPException(503, "GLM/임베딩 연결 오류: " + str(exc)[:500])
         conversation_id = memory.add_conversation(payload.question, answer)
         return {
             "conversation_id": conversation_id,
@@ -65,7 +77,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/memory/search")
     async def memory_search(q: str, limit: int = 5) -> dict:
-        return {"items": memory.search(q, max(1, min(limit, 20)))}
+        return {"items": await asyncio.to_thread(retriever.search, q, max(1, min(limit, 20)))}
 
     @app.get("/api/history")
     async def history(limit: int = 20) -> dict:
@@ -79,6 +91,34 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/api/reflection")
     async def reflection(limit: int = 50) -> dict:
         return await run_reflection(memory, llm, max(1, min(limit, 200)))
+
+    @app.post("/api/agent/run")
+    async def agent_run(payload: ChatRequest) -> dict:
+        return await agent.run(payload.question)
+
+    @app.get("/api/agent/runs/{run_id}")
+    async def agent_history(run_id: str) -> dict:
+        try:
+            return agent.get(run_id)
+        except KeyError:
+            raise HTTPException(404, "run not found")
+
+    @app.post("/api/embeddings/reindex")
+    async def reindex(force: bool = False) -> dict:
+        try:
+            return {"indexed": await asyncio.to_thread(retriever.reindex, force)}
+        except (ValueError, RuntimeError) as exc:
+            raise HTTPException(400, str(exc))
+
+    @app.post("/api/diagnostics/embedding")
+    async def diagnose_embedding() -> dict:
+        if retriever.encoder is None:
+            return {"ok": False, "message": "임베딩이 꺼져 있습니다"}
+        try:
+            vectors = await asyncio.to_thread(retriever.encoder.encode, ["연결 진단"])
+            return {"ok": True, "dimensions": len(vectors[0]), "mode": cfg.embedding_mode}
+        except Exception as exc:
+            return {"ok": False, "message": str(exc)}
 
     @app.get("/", response_class=HTMLResponse)
     async def home() -> str:
@@ -108,6 +148,8 @@ textarea{min-height:100px}button{padding:10px 14px;margin:8px 6px 0 0;border:0;b
 <div class="card">
 <textarea id="q" placeholder="예: Air Dome Zone 3 압력을 올렸는데 C5가 반대로 움직였어. 원인이 뭘까?"></textarea>
 <button class="primary" onclick="ask()">질문하기</button>
+<button onclick="runAgent(this)">에이전트 실행</button>
+<pre id="agentResult" style="white-space:pre-wrap"></pre>
 </div>
 <div class="card" id="result" style="display:none">
 <h3>답변</h3><div id="answer" class="answer"></div>
@@ -118,6 +160,7 @@ textarea{min-height:100px}button{padding:10px 14px;margin:8px 6px 0 0;border:0;b
 <button onclick="feedback('important')">★ 중요지식</button>
 </div>
 <div class="card">
+<h3>연결 진단</h3><button onclick="diagnose()">로컬 임베딩 진단</button><button onclick="reindex()">기억 임베딩 갱신</button><pre id="diagnostic"></pre>
 <h3>자기개선 Reflection</h3>
 <p class="muted">누적된 해결/실패 case를 GLM이 다시 비교해 재사용 가능한 knowledge candidate를 만듭니다.</p>
 <button onclick="reflectNow()">Reflection 실행</button>
@@ -125,9 +168,25 @@ textarea{min-height:100px}button{padding:10px 14px;margin:8px 6px 0 0;border:0;b
 </div>
 <script>
 let currentId=null;
+async function request(url,body){
+ const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+ if(!r.ok)throw new Error(await r.text()); return r.json();
+}
+async function runAgent(button){
+ const question=document.getElementById('q').value.trim(); if(!question)return;
+ button.disabled=true; const box=document.getElementById('agentResult');box.textContent='계획 및 도구 실행 중...';
+ try {const d=await request('/api/agent/run',{question});currentId=d.conversation_id||null;
+ box.textContent='실행 상태: '+d.status+' / ID: '+d.id+'\n'+d.steps.map((s,i)=>'단계 '+(i+1)+': '+JSON.stringify(s)).join('\n')+'\n'+(d.answer||d.error||'');
+ if(d.conversation_id){document.getElementById('result').style.display='block';document.getElementById('answer').textContent=d.answer;document.getElementById('memories').textContent='';}
+ }catch(e){box.textContent=e.message;}finally{button.disabled=false;}
+}
+async function diagnose(){try{document.getElementById('diagnostic').textContent=JSON.stringify(await request('/api/diagnostics/embedding',{}),null,2);}catch(e){document.getElementById('diagnostic').textContent=e.message;}}
+async function reindex(){try{document.getElementById('diagnostic').textContent=JSON.stringify(await request('/api/embeddings/reindex',{}));}catch(e){document.getElementById('diagnostic').textContent=e.message;}}
+
 async function ask(){
   const question=document.getElementById('q').value.trim(); if(!question)return;
   const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question})});
+  if(!r.ok){alert(await r.text());return;}
   const d=await r.json(); currentId=d.conversation_id;
   document.getElementById('result').style.display='block'; document.getElementById('answer').textContent=d.answer;
   const m=document.getElementById('memories'); m.innerHTML='<h4>자동으로 참고한 과거 기록 '+d.memory_hits.length+'개</h4>';
