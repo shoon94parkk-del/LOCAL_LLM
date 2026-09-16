@@ -11,7 +11,7 @@ from app.agent import Agent
 from app.config import Settings, settings as default_settings
 from app.db import Database
 from app.embeddings import HybridRetriever, LocalEmbeddings
-from app.llm import MockLLM, PlaywrightGLM
+from app.llm import MockLLM, PlaywrightGLM, SeleniumGLM
 from app.llm.browser_bridge import BrowserBridge
 from app.memory import MemoryStore
 from app.prompt_builder import build_prompt
@@ -20,7 +20,7 @@ from app.web_ui import INDEX_HTML
 
 
 class ChatRequest(BaseModel):
-    question: str = Field(min_length=1, max_length=12000)
+    question: str = Field(min_length=1, max_length=240000)
 
 
 class AgentRequest(ChatRequest):
@@ -28,7 +28,7 @@ class AgentRequest(ChatRequest):
 
 
 class BridgeResponse(BaseModel):
-    answer: str = Field(default="", max_length=200000)
+    answer: str = Field(default="", max_length=240000)
     error: str = Field(default="", max_length=1000)
 
 
@@ -49,7 +49,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     db = Database(cfg.db_path)
     memory = MemoryStore(db)
 
-    if cfg.glm_mode not in {"mock", "playwright", "browser_bridge"}:
+    if cfg.glm_mode not in {"mock", "playwright", "selenium", "browser_bridge"}:
         raise ValueError("Unknown GLM mode")
     if cfg.embedding_mode not in {"disabled", "local"}:
         raise ValueError("Unknown embedding mode")
@@ -58,7 +58,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         memory,
         LocalEmbeddings(cfg) if cfg.embedding_mode == "local" else None,
     )
-    llm = PlaywrightGLM(cfg) if cfg.glm_mode == "playwright" else MockLLM()
+    if cfg.glm_mode == "playwright":
+        llm = PlaywrightGLM(cfg)
+    elif cfg.glm_mode == "selenium":
+        llm = SeleniumGLM(
+            cfg.glm_url,
+            timeout_ms=cfg.glm_timeout_ms,
+            input_selector=cfg.glm_input_selector,
+            submit_selector=cfg.glm_submit_selector,
+            response_selector=cfg.glm_response_selector,
+            stop_selector=cfg.glm_stop_selector,
+            stable_seconds=cfg.glm_stable_seconds,
+        )
+    else:
+        llm = MockLLM()
+
     if cfg.glm_mode == "browser_bridge":
         if not cfg.browser_bridge_token:
             raise ValueError("브라우저 연결 토큰 설정이 필요합니다")
