@@ -11,12 +11,18 @@ from app.main import create_app
 
 
 def config(tmp_path, **kwargs):
+    # Tests that exercise mutating tools opt out explicitly; production default stays protected.
+    kwargs.setdefault('agent_require_approval', False)
     return Settings(_env_file=None, db_path=str(tmp_path/'db'), agent_workspace=str(tmp_path/'workspace'), **kwargs)
 
 
 class SequenceLLM:
     def __init__(self, responses): self.responses = iter(responses)
     async def generate(self, prompt): return next(self.responses)
+
+
+def test_default_approval_is_enabled():
+    assert Settings(_env_file=None).agent_require_approval is True
 
 
 def test_mock_agent_persists_and_feedback(tmp_path):
@@ -144,12 +150,16 @@ def test_skills_and_file_tools(tmp_path):
         asyncio.run(agent.execute(Action(tool='write_file',arguments={'path':'../outside.md','content':'no'}),run))
 
 
-def test_bridge_waits_for_matching_response():
+def test_bridge_waits_for_matching_response(tmp_path):
     from app.llm.browser_bridge import BrowserBridge
     async def scenario():
-        bridge=BrowserBridge(timeout=1)
+        cfg=config(tmp_path, glm_input_selector='#prompt', glm_response_selector='.answer', glm_stop_selector='.stop')
+        bridge=BrowserBridge(cfg, timeout=1)
         task=asyncio.create_task(bridge.generate('prompt'))
         await asyncio.sleep(0)
+        assert bridge.pending['selectors']['input'] == '#prompt'
+        assert bridge.pending['selectors']['response'] == '.answer'
+        assert bridge.pending['selectors']['stop'] == '.stop'
         with pytest.raises(ValueError): bridge.complete('wrong','answer')
         bridge.complete(bridge.pending['id'],'actual answer')
         assert await task=='actual answer'
@@ -165,7 +175,14 @@ def test_bridge_requires_token(tmp_path):
     assert client.get('/api/browser/pending',headers={'X-Bridge-Token':'local-test-token'}).json()=={'job':None}
 
 
-def test_parse_gemini_json_prefix_and_windows_path():
+def test_health_exposes_approval_state(tmp_path):
+    client=TestClient(create_app(config(tmp_path, agent_require_approval=True)))
+    health=client.get('/health').json()
+    assert health['approval_required'] is True
+    assert health['agent_max_steps'] == 8
+
+
+def test_parse_model_json_prefix_and_windows_path():
     from app.agent import parse_action
     action = parse_action('JSON\n{"tool":"read_file","arguments":{"path":"reports\\run-1.md"}}')
     assert action.tool == 'read_file'
