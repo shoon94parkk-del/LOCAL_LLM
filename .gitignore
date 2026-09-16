@@ -5,4 +5,5 @@ __pycache__/
 data/
 .browser-profile/
 .gemini-profile/
+browser-extension/config.js
 *.pyc
