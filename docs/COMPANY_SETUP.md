@@ -1,54 +1,82 @@
 # 회사 PC 연결 가이드
 
-## 설치
+## 1. 설치
 
-Python 3.11 이상, 저장소 루트에서 실행합니다. 기존 .env는 덮어쓰지 마세요.
+Python 3.11 이상, 저장소 루트에서 실행합니다. 기존 `.env`는 덮어쓰지 마세요.
 
 ```bat
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
 pip install -r requirements-embeddings.txt
-playwright install chromium
 copy .env.example .env
 ```
 
-인터넷이 차단된 PC는 승인된 사내 패키지 저장소 또는 같은 OS/Python용 wheel 및 Playwright 브라우저 설치 파일이 필요합니다. 모델 파일과 sentence-transformers/PyTorch 라이브러리는 별개입니다.
+Playwright 방식도 사용할 경우 한 번만 실행합니다.
 
-## 로컬 임베딩
-
-```dotenv
-LOCAL_LLM_EMBEDDING_MODE=local
-LOCAL_LLM_EMBEDDING_MODEL_PATH=C:/company/models/your-embedding-model
-LOCAL_LLM_EMBEDDING_DEVICE=cpu
+```bat
+playwright install chromium
 ```
 
-SentenceTransformers로 로드 가능한 완전한 모델 폴더(가중치, tokenizer, config 등)를 지원합니다. GGUF/ONNX 파일 하나나 전용 런타임 모델은 지원하지 않으므로 모델명·폴더 구조 확인 후 별도 어댑터가 필요할 수 있습니다. 자동 다운로드와 모델의 임의 Python 코드 실행은 비활성화됩니다.
+인터넷이 차단된 PC는 승인된 사내 패키지 저장소 또는 같은 OS/Python용 wheel 및 Playwright 브라우저 설치 파일이 필요합니다.
 
-E5 등 모델 설명이 요구하는 경우에만 접두어를 설정하세요.
+## 2. GLM 연결 방식
 
-```dotenv
-LOCAL_LLM_EMBEDDING_QUERY_PREFIX="query: "
-LOCAL_LLM_EMBEDDING_DOCUMENT_PREFIX="passage: "
-```
-
-서버 실행 후 **로컬 임베딩 진단**에서 차원을 확인하고 **기억 임베딩 갱신**을 누르세요. 검색할 때 새 기록과 변경된 사례는 자동으로 임베딩됩니다. 기존 DB 기록은 보존합니다. 같은 경로의 모델 가중치를 교체했다면 `POST /api/embeddings/reindex?force=true`로 재색인하세요.
-
-오류 발생 시 키워드 검색으로 몰래 바꾸지 않습니다. 임베딩 없이 사용할 때는 `LOCAL_LLM_EMBEDDING_MODE=disabled`로 바꾸고 재시작하세요. 현재 SQLite 벡터를 전체 비교하므로 소규모 개인 기억 저장소용입니다.
-
-## GLM 웹 연결
+LOCAL_LLM은 `playwright`와 `browser_bridge` 두 방식 모두 같은 GLM selector 설정을 사용합니다.
 
 ```dotenv
-LOCAL_LLM_GLM_MODE=playwright
-LOCAL_LLM_GLM_URL=https://실제-사내-주소/
 LOCAL_LLM_GLM_INPUT_SELECTOR=textarea
 LOCAL_LLM_GLM_SUBMIT_SELECTOR=
 LOCAL_LLM_GLM_RESPONSE_SELECTOR=실제-답변-블록-selector
 LOCAL_LLM_GLM_STOP_SELECTOR=실제-생성중-중지버튼-selector
+LOCAL_LLM_GLM_STABLE_SECONDS=5
+```
+
+- `INPUT`: 질문 입력 영역
+- `SUBMIT`: 전송 버튼. 비우면 Enter 전송을 시도
+- `RESPONSE`: assistant 답변 영역
+- `STOP`: 생성 중에만 보이는 중지 버튼. 설정 권장
+
+### A. Browser Bridge 권장
+
+이미 회사 브라우저에서 GLM 5.3 Flash에 로그인해 사용하는 환경이면 이 방식이 가장 단순합니다.
+
+`.env`:
+
+```dotenv
+LOCAL_LLM_GLM_MODE=browser_bridge
+LOCAL_LLM_BROWSER_BRIDGE_TOKEN=충분히-긴-임의-로컬-토큰
+```
+
+확장 프로그램 설정:
+
+```bat
+copy browser-extension\config.example.js browser-extension\config.js
+```
+
+`browser-extension/config.js`를 열어 `.env`와 같은 토큰 및 사내 GLM origin을 입력합니다.
+
+```js
+const BRIDGE_TOKEN = '동일한-토큰';
+const GLM_WEB_ORIGIN = 'https://사내-GLM-호스트';
+```
+
+`config.js`는 gitignore되어 저장소에 올라가지 않습니다.
+
+Chrome/Edge의 확장 프로그램 개발자 모드에서 `browser-extension` 폴더를 압축해제 확장 프로그램으로 로드합니다. 사내 GLM 페이지에서 우하단 **LOCAL Agent 연결 시작**을 눌러 연결합니다.
+
+확장 프로그램은 여러 웹페이지에 content script가 로드될 수 있지만, 실제 LOCAL Agent 동작은 `GLM_WEB_ORIGIN`과 정확히 일치하는 origin에서만 허용합니다. GLM DOM selector는 확장 프로그램에 하드코딩하지 않고 LOCAL_LLM 서버가 `.env` 값을 매 요청 전달합니다.
+
+### B. Playwright
+
+```dotenv
+LOCAL_LLM_GLM_MODE=playwright
+LOCAL_LLM_GLM_URL=https://실제-사내-주소/
+LOCAL_LLM_GLM_USER_DATA_DIR=.browser-profile
 LOCAL_LLM_GLM_HEADLESS=false
 ```
 
-회사 페이지에서 개발자 도구 또는 `playwright codegen 사내URL`로 selector를 확인하세요. 답변 selector는 assistant 답변만 선택해야 합니다. 전송 selector가 비면 Enter로 전송합니다.
+회사 페이지에서 개발자 도구 또는 `playwright codegen 사내URL`로 selector를 확인하세요.
 
 앱과 daily_reflection을 종료한 상태에서:
 
@@ -57,24 +85,68 @@ python scripts\connect_company.py
 python scripts\connect_company.py --send-test
 ```
 
-첫 명령은 로그인과 selector 일치 개수만 확인합니다. 두 번째는 로그인 확인 후 테스트 질문을 실제 전송합니다. 같은 `.browser-profile`을 쓰는 앱/CLI는 동시에 실행하지 마세요. 앱 내부 GLM 호출은 순차 실행됩니다.
+같은 `.browser-profile`을 쓰는 앱/CLI는 동시에 실행하지 마세요.
 
-응답 개수가 늘고 텍스트가 안정되면 반환합니다. 생성 중 표시 selector를 설정하면 표시가 사라질 때까지 기다립니다. 미설정 시 긴 스트리밍 중단을 완료로 오인할 수 있습니다. 기존 답변 블록을 재사용하는 사이트는 회사에서 어댑터 조정이 필요합니다.
+## 3. 로컬 임베딩
 
-## 실행
+```dotenv
+LOCAL_LLM_EMBEDDING_MODE=local
+LOCAL_LLM_EMBEDDING_MODEL_PATH=C:/company/models/your-embedding-model
+LOCAL_LLM_EMBEDDING_DEVICE=cpu
+```
+
+SentenceTransformers로 로드 가능한 완전한 모델 폴더를 지원합니다. 자동 다운로드와 모델의 임의 Python 코드 실행은 비활성화됩니다.
+
+E5 등 모델 설명이 요구하는 경우에만 접두어를 설정하세요.
+
+```dotenv
+LOCAL_LLM_EMBEDDING_QUERY_PREFIX="query: "
+LOCAL_LLM_EMBEDDING_DOCUMENT_PREFIX="passage: "
+```
+
+UI의 **도구 · 설정 → 임베딩 진단**에서 연결을 확인하고 필요하면 기억 재색인을 실행합니다.
+
+## 4. 실행
 
 ```bat
 uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
-http://127.0.0.1:8000 에서 사용합니다. 분석할 UTF-8 텍스트 파일을 `data/workspace`에 두고 요청하세요.
+브라우저에서 `http://127.0.0.1:8000`을 엽니다.
 
-> experiment.txt를 읽고 관련 과거 사례를 검색해 원인 가설과 추가 확인 항목을 보고서로 만들어줘.
+메인 화면에서는 `질문하기`와 `에이전트 실행`을 구분하지 않습니다. 요청을 한 번 입력하면 Agent가 관련 기억과 Skill을 확인하고 필요한 도구를 선택합니다.
 
-**에이전트 실행**은 계획 → 도구 실행 → 결과 검토를 최대 8회 반복합니다. 도구는 memory_search, list_files, read_file, write_report, finish입니다. 보고서는 `data/workspace/reports`의 새 Markdown 파일로 생성하며 덮어쓰지 않습니다. 작업 폴더 밖 접근과 숨김 파일 읽기를 차단합니다. 임의 셸 실행, 설비 조작, 이메일 전송은 제공하지 않습니다.
+예:
 
-`GET /api/agent/runs/{id}`로 저장된 실행 기록을 조회합니다. completed는 모델이 최종 답변을 제출했다는 뜻입니다. 실제 결과를 확인한 뒤 해결됨/실패 피드백을 남기세요. step_limit은 횟수 소진, failed는 실행 오류입니다. 서버 강제 종료 시 running으로 남을 수 있고 자동 재개는 지원하지 않습니다.
+> experiment.txt를 읽고 관련 과거 사례를 검색해서 Air Dome 이상 원인과 추가 확인 항목을 보고서로 만들어줘.
 
-Mock은 기억 검색과 테스트 응답만 수행합니다. 회사 GLM의 JSON 준수, 실제 모델 로딩과 검색 품질은 회사에서 검증해야 합니다. Reflection은 후보 지식을 생성하며 모델 재학습이 아닙니다. 서버는 개인 PC의 loopback 실행용입니다.
+실행 과정은 채팅 안의 타임라인으로 표시됩니다. 상세 JSON 기록은 **상세 실행 로그**를 펼쳤을 때만 보입니다.
 
-추가 API: `POST /api/agent/run` (question 필드), `POST /api/diagnostics/embedding`, `POST /api/embeddings/reindex?force=false`.
+## 5. 승인과 작업 폴더
+
+기본값은 다음과 같습니다.
+
+```dotenv
+LOCAL_LLM_AGENT_REQUIRE_APPROVAL=true
+LOCAL_LLM_AGENT_WORKSPACE=data/workspace
+```
+
+읽기와 기억 검색은 자동 실행할 수 있지만, 파일 생성·명령 실행·Git commit 등 변경 도구는 승인 카드가 나타난 뒤 사용자가 승인해야 진행합니다.
+
+작업 폴더 밖 접근과 숨김 파일 접근은 차단합니다. 기존 파일 덮어쓰기도 기본 차단합니다. `run_command`는 python/py/git으로 제한되어 있으며 승인 보호를 끄는 것은 권장하지 않습니다.
+
+## 6. 기억과 자기개선
+
+완료된 Agent 답변 아래에서 `해결됨 / 실패 / 중요지식`을 기록할 수 있습니다. 해결/실패 대화는 case로 승격됩니다.
+
+Reflection은 **도구 · 설정** 패널에서 수동 실행할 수 있습니다. 현재 Reflection은 knowledge candidate를 만드는 단계이며 모델 재학습은 아닙니다.
+
+## 7. 상태 확인
+
+- `GET /health`: GLM mode, 승인 보호 상태, Agent 최대 step
+- `GET /api/agent/runs`: 최근 Agent 실행
+- `GET /api/agent/runs/{id}`: 한 실행의 상세 기록
+- `GET /api/workspace`: 작업 폴더
+- `GET /api/skills`: 설치된 Skill
+
+Mock은 실제 사내 GLM 없이 Agent 흐름을 검증하는 용도입니다. 회사 GLM의 JSON 준수와 실제 selector는 회사 PC에서 최종 검증해야 합니다.
