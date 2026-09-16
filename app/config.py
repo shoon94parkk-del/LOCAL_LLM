@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     agent_max_steps: int = 8
     glm_stop_selector: str = ""
     glm_stable_seconds: float = 5.0
+    browser_bridge_token: str = ""
+    skills_dir: str = "skills"
+    agent_allowed_roots: list[str] = []
 
     model_config = SettingsConfigDict(env_file=".env", env_prefix="LOCAL_LLM_", extra="ignore")
 

@@ -1,5 +1,7 @@
 import asyncio
-from fastapi import FastAPI, HTTPException
+import secrets
+from fastapi import FastAPI, HTTPException, Header
+from app.llm.browser_bridge import BrowserBridge
 from app.agent import Agent
 from app.embeddings import LocalEmbeddings, HybridRetriever
 from fastapi.responses import HTMLResponse
@@ -15,6 +17,15 @@ from app.reflection import run_reflection
 
 class ChatRequest(BaseModel):
     question: str = Field(min_length=1, max_length=12000)
+
+
+class AgentRequest(ChatRequest):
+    skill: str | None = None
+
+
+class BridgeResponse(BaseModel):
+    answer: str = Field(default='', max_length=200000)
+    error: str = Field(default='', max_length=1000)
 
 
 class FeedbackRequest(BaseModel):
@@ -33,18 +44,42 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     cfg.ensure_paths()
     db = Database(cfg.db_path)
     memory = MemoryStore(db)
-    if cfg.glm_mode not in {"mock", "playwright"}:
+    if cfg.glm_mode not in {"mock", "playwright", "browser_bridge"}:
         raise ValueError("Unknown GLM mode")
     if cfg.embedding_mode not in {"disabled", "local"}:
         raise ValueError("Unknown embedding mode")
     retriever = HybridRetriever(memory, LocalEmbeddings(cfg) if cfg.embedding_mode == "local" else None)
     llm = PlaywrightGLM(cfg) if cfg.glm_mode.lower() == "playwright" else MockLLM()
+    if cfg.glm_mode == 'browser_bridge':
+        if not cfg.browser_bridge_token:
+            raise ValueError('브라우저 연결 토큰 설정이 필요합니다')
+        llm = BrowserBridge(cfg.glm_timeout_ms / 1000)
 
     agent = Agent(cfg, memory, retriever, llm)
     app = FastAPI(title=cfg.app_name)
     app.state.settings = cfg
     app.state.memory = memory
     app.state.llm = llm
+
+    def bridge_auth(token):
+        if not isinstance(llm, BrowserBridge):
+            raise HTTPException(409, 'browser_bridge 모드가 아닙니다')
+        if not secrets.compare_digest(token or '', cfg.browser_bridge_token):
+            raise HTTPException(403, '브라우저 연결 토큰이 올바르지 않습니다')
+
+    @app.get('/api/browser/pending')
+    async def browser_pending(x_bridge_token: str | None = Header(default=None)):
+        bridge_auth(x_bridge_token)
+        return {'job': llm.pending}
+
+    @app.post('/api/browser/result/{job_id}')
+    async def browser_result(job_id: str, payload: BridgeResponse, x_bridge_token: str | None = Header(default=None)):
+        bridge_auth(x_bridge_token)
+        try:
+            llm.complete(job_id, payload.answer, payload.error)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc))
+        return {'ok': True}
 
     @app.get("/health")
     async def health() -> dict:
@@ -93,8 +128,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return await run_reflection(memory, llm, max(1, min(limit, 200)))
 
     @app.post("/api/agent/run")
-    async def agent_run(payload: ChatRequest) -> dict:
-        return await agent.run(payload.question)
+    async def agent_run(payload: AgentRequest) -> dict:
+        try:
+            return await agent.run(payload.question, payload.skill)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+
+    @app.get("/api/skills")
+    async def skills() -> dict:
+        return {"items": agent.skills.list(), "allowed_roots": [str(p) for p in agent.allowed_roots]}
 
     @app.get("/api/agent/runs/{run_id}")
     async def agent_history(run_id: str) -> dict:
@@ -102,6 +144,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return agent.get(run_id)
         except KeyError:
             raise HTTPException(404, "run not found")
+
+    @app.get("/api/agent/runs")
+    async def agent_runs(limit: int = 20) -> dict:
+        limit = max(1, min(limit, 100))
+        with db.connect() as conn:
+            rows = conn.execute("SELECT payload FROM agent_runs ORDER BY rowid DESC LIMIT ?", (limit,)).fetchall()
+        import json
+        return {"items": [json.loads(row["payload"]) for row in rows]}
 
     @app.post("/api/embeddings/reindex")
     async def reindex(force: bool = False) -> dict:
@@ -144,10 +194,14 @@ textarea{min-height:100px}button{padding:10px 14px;margin:8px 6px 0 0;border:0;b
 </head>
 <body>
 <h1>LOCAL_LLM Memory Agent</h1>
-<p class="muted">질문 → 과거 기억 검색 → GLM 프롬프트 자동 조립 → 응답/피드백 저장 → Reflection 지식 생성</p>
+<p class="muted">질문 → 계획 → Skill/기억/파일 도구 실행 → 결과 확인 → 답변과 실행 기록 저장</p>
+<div class="card"><h3>처음 사용하는 방법</h3>
+<ol><li>Skill을 선택하거나 <b>자동 선택</b>을 둡니다.</li><li>작업 폴더에 참고할 UTF-8 텍스트 파일을 넣습니다.</li><li>구체적으로 요청합니다. 예: <code>experiment.txt를 읽고 원인 가설 보고서를 새 파일로 만들어줘</code></li><li><b>에이전트 실행</b>을 누르고, 생성된 파일과 답변을 확인합니다.</li></ol>
+<p class="muted">에이전트는 최대 8단계로 memory_search, list_files, read_file, create_directory, write_file, write_report를 실행할 수 있습니다. 기존 파일 덮어쓰기·삭제·임의 셸 실행은 차단됩니다.</p></div>
 <div class="card">
 <textarea id="q" placeholder="예: Air Dome Zone 3 압력을 올렸는데 C5가 반대로 움직였어. 원인이 뭘까?"></textarea>
 <button class="primary" onclick="ask()">질문하기</button>
+<label>Skill <select id="skill"><option value="">자동 선택</option></select></label>
 <button onclick="runAgent(this)">에이전트 실행</button>
 <pre id="agentResult" style="white-space:pre-wrap"></pre>
 </div>
@@ -168,6 +222,7 @@ textarea{min-height:100px}button{padding:10px 14px;margin:8px 6px 0 0;border:0;b
 </div>
 <script>
 let currentId=null;
+fetch('/api/skills').then(r=>r.json()).then(d=>{d.items.forEach(s=>{const o=document.createElement('option');o.value=s.name;o.textContent=s.name;document.getElementById('skill').appendChild(o);});});
 async function request(url,body){
  const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
  if(!r.ok)throw new Error(await r.text()); return r.json();
@@ -175,7 +230,7 @@ async function request(url,body){
 async function runAgent(button){
  const question=document.getElementById('q').value.trim(); if(!question)return;
  button.disabled=true; const box=document.getElementById('agentResult');box.textContent='계획 및 도구 실행 중...';
- try {const d=await request('/api/agent/run',{question});currentId=d.conversation_id||null;
+ try {const d=await request('/api/agent/run',{question,skill:document.getElementById('skill').value||null});currentId=d.conversation_id||null;
  box.textContent='실행 상태: '+d.status+' / ID: '+d.id+'\n'+d.steps.map((s,i)=>'단계 '+(i+1)+': '+JSON.stringify(s)).join('\n')+'\n'+(d.answer||d.error||'');
  if(d.conversation_id){document.getElementById('result').style.display='block';document.getElementById('answer').textContent=d.answer;document.getElementById('memories').textContent='';}
  }catch(e){box.textContent=e.message;}finally{button.disabled=false;}

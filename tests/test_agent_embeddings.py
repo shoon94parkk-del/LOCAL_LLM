@@ -123,3 +123,43 @@ def test_model_load_is_local_only(tmp_path, monkeypatch):
     assert calls['local_files_only'] is True
     assert calls['trust_remote_code'] is False
     assert calls['texts']==['query: hello']
+
+
+def test_skills_and_file_tools(tmp_path):
+    from app.agent import Action
+    cfg=config(tmp_path,skills_dir=str(tmp_path/'skills'))
+    folder=tmp_path/'skills'/'demo'
+    folder.mkdir(parents=True)
+    (folder/'SKILL.md').write_text('Write and verify a report.',encoding='utf-8')
+    memory=MemoryStore(Database(cfg.db_path))
+    agent=Agent(cfg,memory,HybridRetriever(memory),SequenceLLM([]))
+    assert agent.skills.read('demo').startswith('Write')
+    with pytest.raises(ValueError): agent.skills.read('../demo')
+    run={'id':'test','steps':[]}
+    asyncio.run(agent.execute(Action(tool='write_file',arguments={'path':'nested/result.md','content':'hello'}),run))
+    assert asyncio.run(agent.execute(Action(tool='read_file',arguments={'path':'nested/result.md'}),run))=='hello'
+    with pytest.raises(FileExistsError):
+        asyncio.run(agent.execute(Action(tool='write_file',arguments={'path':'nested/result.md','content':'overwrite'}),run))
+    with pytest.raises(ValueError):
+        asyncio.run(agent.execute(Action(tool='write_file',arguments={'path':'../outside.md','content':'no'}),run))
+
+
+def test_bridge_waits_for_matching_response():
+    from app.llm.browser_bridge import BrowserBridge
+    async def scenario():
+        bridge=BrowserBridge(timeout=1)
+        task=asyncio.create_task(bridge.generate('prompt'))
+        await asyncio.sleep(0)
+        with pytest.raises(ValueError): bridge.complete('wrong','answer')
+        bridge.complete(bridge.pending['id'],'actual answer')
+        assert await task=='actual answer'
+        assert bridge.pending is None
+        with pytest.raises(ValueError): bridge.complete('old','duplicate')
+    asyncio.run(scenario())
+
+
+def test_bridge_requires_token(tmp_path):
+    cfg=config(tmp_path,glm_mode='browser_bridge',browser_bridge_token='local-test-token')
+    client=TestClient(create_app(cfg))
+    assert client.get('/api/browser/pending').status_code==403
+    assert client.get('/api/browser/pending',headers={'X-Bridge-Token':'local-test-token'}).json()=={'job':None}
