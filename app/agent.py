@@ -12,6 +12,23 @@ class Action(BaseModel):
     arguments: dict = Field(default_factory=dict)
 
 
+def parse_action(raw: str) -> Action:
+    text = raw.strip()
+    if text.startswith('```'):
+        text = text.split('\n', 1)[1].rsplit('```', 1)[0]
+    start, end = text.find('{'), text.rfind('}')
+    if start < 0 or end <= start:
+        raise ValueError('Gemini 응답에서 JSON 객체를 찾지 못했습니다')
+    text = text[start:end + 1]
+    try:
+        return Action.model_validate_json(text)
+    except ValueError:
+        # Gemini occasionally emits a Windows path with a single backslash.
+        import re
+        repaired = re.sub(r'\\(?!["\\/bfnrtu])', '/', text)
+        return Action.model_validate_json(repaired)
+
+
 class Agent:
     def __init__(self, cfg, memory, retriever, llm):
         self.cfg, self.memory, self.retriever, self.llm = cfg, memory, retriever, llm
@@ -107,12 +124,7 @@ class Agent:
                 prompt = instruction + json.dumps({'goal': goal, 'steps': run['steps']}, ensure_ascii=False)
                 raw = await self.llm.generate(prompt)
                 try:
-                    text = raw.strip()
-                    if text.startswith('```'):
-                        text = text.split('\n', 1)[1].rsplit('```', 1)[0]
-                    elif text.lower().startswith('json'):
-                        text = text[4:].lstrip(': \r\n')
-                    action = Action.model_validate_json(text)
+                    action = parse_action(raw)
                     signature = json.dumps({'tool': action.tool, 'arguments': action.arguments}, sort_keys=True, ensure_ascii=False)
                     seen_actions[signature] = seen_actions.get(signature, 0) + 1
                     if seen_actions[signature] >= 3:

@@ -163,3 +163,10 @@ def test_bridge_requires_token(tmp_path):
     client=TestClient(create_app(cfg))
     assert client.get('/api/browser/pending').status_code==403
     assert client.get('/api/browser/pending',headers={'X-Bridge-Token':'local-test-token'}).json()=={'job':None}
+
+
+def test_parse_gemini_json_prefix_and_windows_path():
+    from app.agent import parse_action
+    action = parse_action('JSON\n{"tool":"read_file","arguments":{"path":"reports\\run-1.md"}}')
+    assert action.tool == 'read_file'
+    assert action.arguments['path'] == 'reports/run-1.md'
