@@ -21,12 +21,16 @@ def parse_action(raw: str) -> Action:
         raise ValueError('Gemini 응답에서 JSON 객체를 찾지 못했습니다')
     text = text[start:end + 1]
     try:
-        return Action.model_validate_json(text)
+        action = Action.model_validate_json(text)
     except ValueError:
         # Gemini occasionally emits a Windows path with a single backslash.
         import re
         repaired = re.sub(r'\\(?!["\\/bfnrtu])', '/', text)
-        return Action.model_validate_json(repaired)
+        action = Action.model_validate_json(repaired)
+    if isinstance(action.arguments.get('path'), str):
+        action.arguments['path'] = (action.arguments['path'].replace('\\', '/')
+                                     .replace('\r', 'r').replace('\n', 'n').replace('\t', 't'))
+    return action
 
 
 class Agent:
