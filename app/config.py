@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     browser_bridge_token: str = ""
     skills_dir: str = "skills"
     agent_allowed_roots: list[str] = []
+    agent_require_approval: bool = False
+    agent_command_timeout: int = 30
 
     model_config = SettingsConfigDict(env_file=".env", env_prefix="LOCAL_LLM_", extra="ignore")
 

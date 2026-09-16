@@ -1,6 +1,9 @@
 import asyncio
 import json
 import uuid
+import hashlib
+import shlex
+import subprocess
 from pathlib import Path
 from pydantic import BaseModel, Field
 from app.skills import SkillStore
@@ -34,6 +37,7 @@ def parse_action(raw: str) -> Action:
 
 
 class Agent:
+    MUTATING_TOOLS = {'write_file', 'write_report', 'create_directory', 'run_command', 'git_commit'}
     def __init__(self, cfg, memory, retriever, llm):
         self.cfg, self.memory, self.retriever, self.llm = cfg, memory, retriever, llm
         self.root = Path(cfg.agent_workspace).resolve()
@@ -86,7 +90,8 @@ class Agent:
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.open('x', encoding='utf-8') as out:
                 out.write(content)
-            return {'artifact': str(path), 'bytes': path.stat().st_size}
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            return {'artifact': str(path), 'bytes': path.stat().st_size, 'sha256': digest, 'verified': path.read_text(encoding='utf-8') == content}
         if action.tool == 'read_file':
             path = self.path(str(args['path']))
             if path.stat().st_size > 100000:
@@ -101,12 +106,47 @@ class Agent:
             path = self.path('reports/' + run['id'] + '-' + str(len(run['steps'])) + '.md')
             with path.open('x', encoding='utf-8') as out:
                 out.write(content)
-            return {'artifact': str(path.relative_to(self.root))}
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            return {'artifact': str(path.relative_to(self.root)), 'sha256': digest, 'verified': path.read_text(encoding='utf-8') == content}
+        if action.tool in {'git_status', 'git_diff', 'git_log'}:
+            args_map = {'git_status': ['status', '--short'], 'git_diff': ['diff', '--stat'], 'git_log': ['log', '-5', '--oneline']}
+            return await self._command(['git', *args_map[action.tool]], self.root)
+        if action.tool == 'git_commit':
+            message = str(args.get('message', '')).strip()
+            if not message or len(message) > 200:
+                raise ValueError('git commit message가 필요합니다')
+            return await self._command(['git', 'commit', '-am', message], self.root)
+        if action.tool == 'run_command':
+            command = str(args.get('command', '')).strip()
+            parts = shlex.split(command, posix=False)
+            if not parts or parts[0].lower() not in {'python', 'py', 'git'}:
+                raise ValueError('허용 명령은 python/py/git으로 시작해야 합니다')
+            if any(x in command.lower() for x in ['del ', 'erase ', ' rm ', 'drop table', 'format ']):
+                raise ValueError('삭제·포맷 명령은 차단됩니다')
+            return await self._command(parts, self.root)
+        if action.tool == 'save_skill':
+            name = str(args.get('name', '')).strip()
+            content = str(args.get('content', '')).strip()
+            if not name.isidentifier() or not content or len(content) > 30000:
+                raise ValueError('skill 이름은 영문 식별자이고 내용이 필요합니다')
+            path = self.skills.root / name / 'SKILL.md'
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if path.exists():
+                raise ValueError('기존 skill 덮어쓰기는 허용되지 않습니다')
+            path.write_text(content, encoding='utf-8')
+            return {'skill': name, 'verified': self.skills.read(name) == content}
         raise ValueError('허용되지 않은 도구: ' + action.tool)
 
-    async def run(self, goal, skill=None):
+    async def _command(self, parts, cwd):
+        def call():
+            completed = subprocess.run(parts, cwd=cwd, capture_output=True, text=True,
+                                       timeout=self.cfg.agent_command_timeout, shell=False)
+            return {'returncode': completed.returncode, 'stdout': completed.stdout[-12000:], 'stderr': completed.stderr[-4000:], 'verified': completed.returncode == 0}
+        return await asyncio.to_thread(call)
+
+    async def run(self, goal, skill=None, existing=None):
         skill_text = self.skills.read(skill) if skill else ""
-        run = {'id': uuid.uuid4().hex, 'goal': goal, 'status': 'running', 'steps': [], 'answer': ''}
+        run = existing or {'id': uuid.uuid4().hex, 'goal': goal, 'status': 'running', 'steps': [], 'answer': ''}
         self.save(run)
         instruction = '''[AGENT_REQUEST]
 목표를 해결하기 위해 계획하고 도구 결과를 검토하며 다음 행동을 정하세요.
@@ -125,7 +165,7 @@ class Agent:
         try:
             seen_actions = {}
             for _ in range(max(1, min(self.cfg.agent_max_steps, 20))):
-                prompt = instruction + json.dumps({'goal': goal, 'steps': run['steps']}, ensure_ascii=False)
+                prompt = instruction + json.dumps({'goal': goal, 'steps': run['steps'], 'pending_action': run.get('pending_action')}, ensure_ascii=False)
                 raw = await self.llm.generate(prompt)
                 try:
                     action = parse_action(raw)
@@ -140,10 +180,17 @@ class Agent:
                         run.update(status='completed', answer=answer)
                         run['conversation_id'] = self.memory.add_conversation(goal, answer)
                         break
+                    if action.tool in self.MUTATING_TOOLS and self.cfg.agent_require_approval and not run.get('approved_action'):
+                        run.update(status='awaiting_approval', pending_action=action.model_dump())
+                        self.save(run)
+                        return run
                     result = await self.execute(action, run)
                     if len(json.dumps(result, ensure_ascii=False)) > 12000:
                         result = {'truncated': True, 'preview': json.dumps(result, ensure_ascii=False)[:12000]}
                     run['steps'].append({'action': action.model_dump(), 'result': result})
+                    if isinstance(result, dict) and result.get('verified') is False:
+                        run['steps'][-1]['error'] = '도구 결과 검증 실패'
+                    run.pop('approved_action', None)
                 except (ValueError, KeyError, OSError) as exc:
                     run['steps'].append({'error': str(exc)[:1000]})
                 self.save(run)
@@ -157,3 +204,17 @@ class Agent:
         finally:
             self.save(run)
         return run
+
+    async def resume(self, run_id, approve=True):
+        run = self.get(run_id)
+        if run.get('status') not in {'awaiting_approval', 'failed', 'cancelled', 'step_limit'}:
+            raise ValueError('재개할 수 없는 실행 상태입니다')
+        if run.get('pending_action') and approve:
+            run['approved_action'] = run.pop('pending_action')
+        elif not approve:
+            run.update(status='denied', pending_action=None)
+            self.save(run)
+            return run
+        run['status'] = 'running'
+        self.save(run)
+        return await self.run(run['goal'], existing=run)
