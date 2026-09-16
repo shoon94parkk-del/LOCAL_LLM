@@ -9,6 +9,10 @@ from pydantic import BaseModel, Field
 from app.skills import SkillStore
 
 
+MAX_TEXT_CHARS = 240_000
+MAX_TOOL_RESULT_CHARS = 240_000
+
+
 class Action(BaseModel):
     plan: str = ''
     tool: str
@@ -21,7 +25,7 @@ def parse_action(raw: str) -> Action:
         text = text.split('\n', 1)[1].rsplit('```', 1)[0]
     start, end = text.find('{'), text.rfind('}')
     if start < 0 or end <= start:
-        raise ValueError('Gemini 응답에서 JSON 객체를 찾지 못했습니다')
+        raise ValueError('GLM 응답에서 JSON 객체를 찾지 못했습니다')
     text = text[start:end + 1]
     try:
         action = Action.model_validate_json(text)
@@ -96,8 +100,8 @@ class Agent:
         if action.tool == 'write_file':
             path = self.path(str(args['path']))
             content = str(args['content'])
-            if len(content.encode('utf-8')) > 100000:
-                raise ValueError('파일은 100KB 이하만 생성할 수 있습니다')
+            if len(content) > MAX_TEXT_CHARS:
+                raise ValueError('파일은 24만 글자 이하만 생성할 수 있습니다')
             if path.suffix.lower() not in {'.txt', '.md', '.csv', '.json', '.html', '.css', '.py', '.js', '.yaml', '.yml'}:
                 raise ValueError('지원하는 텍스트 확장자를 사용하세요')
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -107,13 +111,15 @@ class Agent:
             return {'artifact': str(path), 'bytes': path.stat().st_size, 'sha256': digest, 'verified': path.read_text(encoding='utf-8') == content}
         if action.tool == 'read_file':
             path = self.path(str(args['path']))
-            if path.stat().st_size > 100000:
-                raise ValueError('파일은 100KB 이하만 읽을 수 있습니다')
-            return path.read_text(encoding='utf-8')
+            with path.open('r', encoding='utf-8') as source:
+                content = source.read(MAX_TEXT_CHARS + 1)
+            if len(content) > MAX_TEXT_CHARS:
+                raise ValueError('파일은 24만 글자 이하만 읽을 수 있습니다')
+            return content
         if action.tool == 'write_report':
             content = str(args['content'])
-            if len(content) > 50000:
-                raise ValueError('보고서 길이 제한 초과')
+            if len(content) > MAX_TEXT_CHARS:
+                raise ValueError('보고서는 24만 글자 이하만 생성할 수 있습니다')
             folder = self.path('reports')
             folder.mkdir(exist_ok=True)
             path = self.path('reports/' + run['id'] + '-' + str(len(run['steps'])) + '.md')
@@ -198,8 +204,9 @@ class Agent:
                         self.save(run)
                         return run
                     result = await self.execute(action, run)
-                    if len(json.dumps(result, ensure_ascii=False)) > 12000:
-                        result = {'truncated': True, 'preview': json.dumps(result, ensure_ascii=False)[:12000]}
+                    serialized_result = json.dumps(result, ensure_ascii=False)
+                    if len(serialized_result) > MAX_TOOL_RESULT_CHARS:
+                        result = {'truncated': True, 'preview': serialized_result[:MAX_TOOL_RESULT_CHARS]}
                     run['steps'].append({'action': action.model_dump(), 'result': result})
                     if isinstance(result, dict) and result.get('verified') is False:
                         run['steps'][-1]['error'] = '도구 결과 검증 실패'
