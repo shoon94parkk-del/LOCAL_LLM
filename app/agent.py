@@ -29,7 +29,7 @@ def parse_action(raw: str) -> Action:
         action = Action.model_validate_json(repaired)
     if isinstance(action.arguments.get('path'), str):
         action.arguments['path'] = (action.arguments['path'].replace('\\', '/')
-                                     .replace('\r', 'r').replace('\n', 'n').replace('\t', 't'))
+                                     .replace('\r', '/r').replace('\n', '/n').replace('\t', '/t'))
     return action
 
 
