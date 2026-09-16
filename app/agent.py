@@ -151,7 +151,7 @@ class Agent:
         instruction = '''[AGENT_REQUEST]
 목표를 해결하기 위해 계획하고 도구 결과를 검토하며 다음 행동을 정하세요.
 응답은 JSON 객체 하나만: {"plan":"간단한 작업 계획", "tool":"도구명", "arguments":{}}
-도구: memory_search(query), list_files(path="."), read_file(path), write_report(content), write_file(path,content), create_directory(path), list_skills(), read_skill(name), finish(answer).
+도구: memory_search(query), list_files(path="."), read_file(path), write_report(content), write_file(path,content), create_directory(path), run_command(command), git_status(), git_diff(), git_log(), git_commit(message), list_skills(), read_skill(name), save_skill(name,content), finish(answer).
 사용 가능한 skill 목록을 보고 적합하면 read_skill로 읽고 적용하세요. 사용자가 선택한 skill은 아래에 포함됩니다.
 파일 생성은 새 파일만 가능하며 기존 파일 덮어쓰기는 금지됩니다.
 파일은 작업 폴더만 접근합니다. write_report는 새 Markdown 보고서를 만듭니다.
@@ -210,7 +210,9 @@ class Agent:
         if run.get('status') not in {'awaiting_approval', 'failed', 'cancelled', 'step_limit'}:
             raise ValueError('재개할 수 없는 실행 상태입니다')
         if run.get('pending_action') and approve:
-            run['approved_action'] = run.pop('pending_action')
+            pending = Action.model_validate(run.pop('pending_action'))
+            result = await self.execute(pending, run)
+            run['steps'].append({'action': pending.model_dump(), 'result': result, 'verified': result.get('verified', True) if isinstance(result, dict) else True})
         elif not approve:
             run.update(status='denied', pending_action=None)
             self.save(run)

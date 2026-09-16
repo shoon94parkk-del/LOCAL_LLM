@@ -139,6 +139,34 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(400, str(exc))
 
+    @app.post("/api/agent/plan")
+    async def agent_plan(payload: AgentRequest) -> dict:
+        return {"goal": payload.question, "steps": [
+            "선택한 Skill과 과거 기억 확인", "필요한 파일·폴더·Git·터미널 도구 실행",
+            "각 결과 검증", "근거와 생성 파일을 포함한 최종 답변"
+        ], "approval_required": cfg.agent_require_approval}
+
+    @app.post("/api/agent/runs/{run_id}/approve")
+    async def agent_approve(run_id: str) -> dict:
+        try:
+            return await agent.resume(run_id, approve=True)
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(400, str(exc))
+
+    @app.post("/api/agent/runs/{run_id}/deny")
+    async def agent_deny(run_id: str) -> dict:
+        try:
+            return await agent.resume(run_id, approve=False)
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(400, str(exc))
+
+    @app.post("/api/agent/runs/{run_id}/resume")
+    async def agent_resume(run_id: str) -> dict:
+        try:
+            return await agent.resume(run_id, approve=True)
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(400, str(exc))
+
     @app.get("/api/skills")
     async def skills() -> dict:
         return {"items": agent.skills.list(), "allowed_roots": [str(p) for p in agent.allowed_roots]}
@@ -241,8 +269,16 @@ async function runAgent(button){
  button.disabled=true; const box=document.getElementById('agentResult');box.textContent='계획 및 도구 실행 중...';
  try {const d=await request('/api/agent/run',{question,skill:document.getElementById('skill').value||null});currentId=d.conversation_id||null;
  box.textContent='실행 상태: '+d.status+' / ID: '+d.id+'\n'+d.steps.map((s,i)=>'단계 '+(i+1)+': '+JSON.stringify(s)).join('\n')+'\n'+(d.answer||d.error||'');
+ if(d.status==='awaiting_approval'){
+   const approve=document.createElement('button'); approve.textContent='이 작업 승인'; approve.onclick=()=>continueAgent(d.id,'approve');
+   const deny=document.createElement('button'); deny.textContent='거부'; deny.onclick=()=>continueAgent(d.id,'deny'); box.append('\\n',approve,deny);
+ }
  if(d.conversation_id){document.getElementById('result').style.display='block';document.getElementById('answer').textContent=d.answer;document.getElementById('memories').textContent='';}
  }catch(e){box.textContent=e.message;}finally{button.disabled=false;}
+}
+async function continueAgent(id, action){
+ const r=await fetch('/api/agent/runs/'+id+'/'+action,{method:'POST'}); const d=await r.json();
+ document.getElementById('agentResult').textContent='실행 상태: '+d.status+' / ID: '+d.id+'\\n'+d.steps.map((s,i)=>'단계 '+(i+1)+': '+JSON.stringify(s)).join('\\n')+'\\n'+(d.answer||d.error||'');
 }
 async function diagnose(){try{document.getElementById('diagnostic').textContent=JSON.stringify(await request('/api/diagnostics/embedding',{}),null,2);}catch(e){document.getElementById('diagnostic').textContent=e.message;}}
 async function reindex(){try{document.getElementById('diagnostic').textContent=JSON.stringify(await request('/api/embeddings/reindex',{}));}catch(e){document.getElementById('diagnostic').textContent=e.message;}}
