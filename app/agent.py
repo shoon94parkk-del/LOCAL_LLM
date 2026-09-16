@@ -102,6 +102,7 @@ class Agent:
         instruction += '\n[설치된 skills]\n' + json.dumps(self.skills.list(), ensure_ascii=False)
         instruction += '\n[선택된 skill]\n' + skill_text + '\n'
         try:
+            seen_actions = {}
             for _ in range(max(1, min(self.cfg.agent_max_steps, 20))):
                 prompt = instruction + json.dumps({'goal': goal, 'steps': run['steps']}, ensure_ascii=False)
                 raw = await self.llm.generate(prompt)
@@ -109,7 +110,13 @@ class Agent:
                     text = raw.strip()
                     if text.startswith('```'):
                         text = text.split('\n', 1)[1].rsplit('```', 1)[0]
+                    elif text.lower().startswith('json'):
+                        text = text[4:].lstrip(': \r\n')
                     action = Action.model_validate_json(text)
+                    signature = json.dumps({'tool': action.tool, 'arguments': action.arguments}, sort_keys=True, ensure_ascii=False)
+                    seen_actions[signature] = seen_actions.get(signature, 0) + 1
+                    if seen_actions[signature] >= 3:
+                        raise ValueError('같은 도구 호출이 3회 반복되어 안전하게 중단했습니다')
                     if action.tool == 'finish':
                         answer = action.arguments.get('answer')
                         if not isinstance(answer, str) or not answer.strip():

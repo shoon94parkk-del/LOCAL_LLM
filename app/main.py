@@ -199,7 +199,7 @@ textarea{min-height:100px}button{padding:10px 14px;margin:8px 6px 0 0;border:0;b
 </head>
 <body>
 <h1>LOCAL_LLM Memory Agent</h1>
-<p class="muted">질문 → 계획 → Skill/기억/파일 도구 실행 → 결과 확인 → 답변과 실행 기록 저장</p>
+<p class="muted">한 단계마다 Gemini가 다음 행동을 정하므로 파일 읽기·쓰기·검증 요청은 3~6회 질문처럼 보일 수 있습니다. 최대 8단계이며 같은 호출 3회 반복 시 안전하게 중단합니다.</p>
 <div class="card"><h3>처음 사용하는 방법</h3>
 <ol><li>Skill을 선택하거나 <b>자동 선택</b>을 둡니다.</li><li>작업 폴더에 참고할 UTF-8 텍스트 파일을 넣습니다.</li><li>구체적으로 요청합니다. 예: <code>experiment.txt를 읽고 원인 가설 보고서를 새 파일로 만들어줘</code></li><li><b>에이전트 실행</b>을 누르고, 생성된 파일과 답변을 확인합니다.</li></ol>
 <p class="muted">에이전트는 최대 8단계로 memory_search, list_files, read_file, create_directory, write_file, write_report를 실행할 수 있습니다. 기존 파일 덮어쓰기·삭제·임의 셸 실행은 차단됩니다.</p></div>
