@@ -1,5 +1,6 @@
 import asyncio
 import secrets
+import subprocess
 from fastapi import FastAPI, HTTPException, Header, Response
 from app.llm.browser_bridge import BrowserBridge
 from app.agent import Agent
@@ -171,6 +172,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def skills() -> dict:
         return {"items": agent.skills.list(), "allowed_roots": [str(p) for p in agent.allowed_roots]}
 
+    @app.get("/api/capabilities")
+    async def capabilities() -> dict:
+        return {"tools": ["memory_search", "read_file", "write_file", "create_directory", "run_command", "git_status", "git_diff", "git_log", "git_commit", "write_report", "save_skill"], "approval_required": cfg.agent_require_approval, "workspace": str(agent.root)}
+
+    @app.get("/api/workspace")
+    async def workspace() -> dict:
+        files = [p.name for p in agent.root.iterdir() if not p.name.startswith('.')]
+        return {"path": str(agent.root), "files": files[:100]}
+
+    @app.post("/api/workspace/open")
+    async def open_workspace() -> dict:
+        # The path is resolved from the configured allow-list, never from user input.
+        await asyncio.to_thread(subprocess.Popen, ["explorer.exe", str(agent.root)], shell=False)
+        return {"ok": True, "path": str(agent.root)}
+
     @app.get("/api/agent/runs/{run_id}")
     async def agent_history(run_id: str) -> dict:
         try:
@@ -222,19 +238,18 @@ INDEX_HTML = r"""
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>LOCAL_LLM Memory Agent</title>
 <style>
-body{font-family:Arial,sans-serif;max-width:980px;margin:32px auto;padding:0 16px;background:#f6f7f9;color:#171717}
-.card{background:white;border:1px solid #ddd;border-radius:12px;padding:18px;margin-bottom:14px}
-textarea,input{width:100%;box-sizing:border-box;padding:12px;border:1px solid #bbb;border-radius:8px}
-textarea{min-height:100px}button{padding:10px 14px;margin:8px 6px 0 0;border:0;border-radius:8px;cursor:pointer}
-.primary{background:#111;color:white}.answer{white-space:pre-wrap}.muted{color:#666;font-size:13px}.memory{font-size:14px;border-top:1px solid #eee;padding-top:8px;margin-top:8px}
+:root{font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;color:#16202a;background:#f3f6f8;line-height:1.5}
+*{box-sizing:border-box}body{max-width:1120px;margin:0 auto;padding:28px 22px 56px}.hero{display:flex;justify-content:space-between;align-items:flex-start;gap:20px;margin-bottom:22px}.eyebrow{font-size:12px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:#167c70}.hero h1{font-size:34px;line-height:1.15;margin:6px 0}.status{border:1px solid #c9d8dc;background:#fff;border-radius:999px;padding:8px 12px;font-size:13px}.muted{color:#60707c;font-size:14px}.card{background:#fff;border:1px solid #dbe4e7;border-radius:16px;padding:20px;margin-bottom:16px;box-shadow:0 8px 24px #263b4510}.card h2,.card h3{margin:0 0 10px}.card h2{font-size:20px}.card h3{font-size:16px}textarea,input,select{width:100%;box-sizing:border-box;padding:13px;border:1px solid #b9c8cd;border-radius:10px;background:#fbfcfc;font:inherit}textarea{min-height:130px;resize:vertical}label{display:block;font-size:13px;font-weight:650;margin-top:12px}button{min-height:42px;padding:10px 15px;margin:10px 6px 0 0;border:1px solid #c4d1d5;border-radius:10px;background:#fff;color:#17252a;cursor:pointer;font-weight:650}button:hover{border-color:#167c70;background:#f0faf8}button:focus-visible,textarea:focus-visible,select:focus-visible{outline:3px solid #83d7c8;outline-offset:2px}.primary{background:#126e64;border-color:#126e64;color:white}.primary:hover{background:#0d594f;color:white}.answer{white-space:pre-wrap;overflow-wrap:anywhere}.memory{font-size:14px;border-top:1px solid #edf1f2;padding-top:8px;margin-top:8px}.cap{display:flex;gap:10px;align-items:flex-start;padding:10px 0;border-top:1px solid #edf1f2}.cap b{font-size:14px}.cap span{font-size:13px;color:#60707c}.pill{display:inline-block;background:#e7f5f2;color:#126e64;border-radius:999px;padding:3px 8px;font-size:12px}.small{font-size:12px}@media(max-width:800px){body{padding:18px 14px}.hero{display:block}.status{display:inline-block;margin-top:10px}.hero h1{font-size:28px}}
 </style>
 </head>
 <body>
-<h1>LOCAL_LLM Memory Agent</h1>
+<div class="hero"><div><div class="eyebrow">Local work agent</div><h1>LOCAL_LLM Agent</h1><p class="muted">Gemini의 판단과 내 PC의 승인된 도구를 연결합니다.</p></div><div class="status" id="mode">연결 상태 확인 중</div></div>
 <p class="muted">한 단계마다 Gemini가 다음 행동을 정하므로 파일 읽기·쓰기·검증 요청은 3~6회 질문처럼 보일 수 있습니다. 최대 8단계이며 같은 호출 3회 반복 시 안전하게 중단합니다.</p>
 <div class="card"><h3>처음 사용하는 방법</h3>
 <ol><li>Skill을 선택하거나 <b>자동 선택</b>을 둡니다.</li><li>작업 폴더에 참고할 UTF-8 텍스트 파일을 넣습니다.</li><li>구체적으로 요청합니다. 예: <code>experiment.txt를 읽고 원인 가설 보고서를 새 파일로 만들어줘</code></li><li><b>에이전트 실행</b>을 누르고, 생성된 파일과 답변을 확인합니다.</li></ol>
 <p class="muted">에이전트는 최대 8단계로 memory_search, list_files, read_file, create_directory, write_file, write_report를 실행할 수 있습니다. 기존 파일 덮어쓰기·삭제·임의 셸 실행은 차단됩니다.</p></div>
+<div class="card"><h3>내 작업 폴더</h3><p class="muted">에이전트가 읽고 새 결과물을 만들 수 있는 폴더입니다.</p><button onclick="openWorkspace()">폴더 열기</button><button onclick="showWorkspace()">파일 목록 보기</button><pre id="workspace" class="small"></pre></div>
+<div class="card"><h3>에이전트가 할 수 있는 일</h3><p class="muted">기억 검색 · 파일/폴더 생성 · 터미널과 Git 확인 · 보고서 작성 · Skill 저장</p><p class="muted small">기존 파일 수정·삭제, 위험 명령, 설비 조작과 메일 전송은 기본 차단됩니다. 승인 설정이 켜져 있으면 변경 작업 전에 승인 버튼이 나타납니다.</p></div>
 <div class="card">
 <textarea id="q" placeholder="예: Air Dome Zone 3 압력을 올렸는데 C5가 반대로 움직였어. 원인이 뭘까?"></textarea>
 <button class="primary" onclick="ask()">질문하기</button>
@@ -259,6 +274,9 @@ textarea{min-height:100px}button{padding:10px 14px;margin:8px 6px 0 0;border:0;b
 </div>
 <script>
 let currentId=null;
+fetch('/health').then(r=>r.json()).then(d=>document.getElementById('mode').textContent=d.glm_mode==='browser_bridge'?'Gemini 브리지 연결':'GLM '+d.glm_mode).catch(()=>document.getElementById('mode').textContent='서버 연결 오류');
+async function openWorkspace(){const r=await fetch('/api/workspace/open',{method:'POST'});const d=await r.json();document.getElementById('workspace').textContent=d.path||d.detail;}
+async function showWorkspace(){const r=await fetch('/api/workspace');const d=await r.json();document.getElementById('workspace').textContent=d.path+'\n'+d.files.join('\n');}
 fetch('/api/skills').then(r=>r.json()).then(d=>{d.items.forEach(s=>{const o=document.createElement('option');o.value=s.name;o.textContent=s.name;document.getElementById('skill').appendChild(o);});});
 async function request(url,body){
  const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
