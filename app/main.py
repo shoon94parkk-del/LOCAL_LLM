@@ -1,19 +1,22 @@
 import asyncio
+import json
 import secrets
 import subprocess
-from fastapi import FastAPI, HTTPException, Header, Response
-from app.llm.browser_bridge import BrowserBridge
-from app.agent import Agent
-from app.embeddings import LocalEmbeddings, HybridRetriever
+
+from fastapi import FastAPI, Header, HTTPException, Response
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
+from app.agent import Agent
 from app.config import Settings, settings as default_settings
 from app.db import Database
+from app.embeddings import HybridRetriever, LocalEmbeddings
 from app.llm import MockLLM, PlaywrightGLM
+from app.llm.browser_bridge import BrowserBridge
 from app.memory import MemoryStore
 from app.prompt_builder import build_prompt
 from app.reflection import run_reflection
+from app.web_ui import INDEX_HTML
 
 
 class ChatRequest(BaseModel):
@@ -25,8 +28,8 @@ class AgentRequest(ChatRequest):
 
 
 class BridgeResponse(BaseModel):
-    answer: str = Field(default='', max_length=200000)
-    error: str = Field(default='', max_length=1000)
+    answer: str = Field(default="", max_length=200000)
+    error: str = Field(default="", max_length=1000)
 
 
 class FeedbackRequest(BaseModel):
@@ -45,16 +48,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     cfg.ensure_paths()
     db = Database(cfg.db_path)
     memory = MemoryStore(db)
+
     if cfg.glm_mode not in {"mock", "playwright", "browser_bridge"}:
         raise ValueError("Unknown GLM mode")
     if cfg.embedding_mode not in {"disabled", "local"}:
         raise ValueError("Unknown embedding mode")
-    retriever = HybridRetriever(memory, LocalEmbeddings(cfg) if cfg.embedding_mode == "local" else None)
-    llm = PlaywrightGLM(cfg) if cfg.glm_mode.lower() == "playwright" else MockLLM()
-    if cfg.glm_mode == 'browser_bridge':
+
+    retriever = HybridRetriever(
+        memory,
+        LocalEmbeddings(cfg) if cfg.embedding_mode == "local" else None,
+    )
+    llm = PlaywrightGLM(cfg) if cfg.glm_mode == "playwright" else MockLLM()
+    if cfg.glm_mode == "browser_bridge":
         if not cfg.browser_bridge_token:
-            raise ValueError('브라우저 연결 토큰 설정이 필요합니다')
-        llm = BrowserBridge(cfg.glm_timeout_ms / 1000)
+            raise ValueError("브라우저 연결 토큰 설정이 필요합니다")
+        llm = BrowserBridge(cfg, cfg.glm_timeout_ms / 1000)
 
     agent = Agent(cfg, memory, retriever, llm)
     app = FastAPI(title=cfg.app_name)
@@ -62,39 +70,56 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.memory = memory
     app.state.llm = llm
 
-    def bridge_auth(token):
+    def bridge_auth(token: str | None) -> None:
         if not isinstance(llm, BrowserBridge):
-            raise HTTPException(409, 'browser_bridge 모드가 아닙니다')
-        if not secrets.compare_digest(token or '', cfg.browser_bridge_token):
-            raise HTTPException(403, '브라우저 연결 토큰이 올바르지 않습니다')
+            raise HTTPException(409, "browser_bridge 모드가 아닙니다")
+        if not secrets.compare_digest(token or "", cfg.browser_bridge_token):
+            raise HTTPException(403, "브라우저 연결 토큰이 올바르지 않습니다")
 
-    @app.get('/api/browser/status')
-    async def browser_status(x_bridge_token: str | None = Header(default=None)):
+    @app.get("/api/browser/status")
+    async def browser_status(x_bridge_token: str | None = Header(default=None)) -> dict:
         bridge_auth(x_bridge_token)
-        return {'connected_mode': True, 'pending': llm.pending is not None, 'job_id': llm.pending['id'] if llm.pending else None}
+        return {
+            "connected_mode": True,
+            "pending": llm.pending is not None,
+            "job_id": llm.pending["id"] if llm.pending else None,
+        }
 
-    @app.get('/api/browser/pending')
-    async def browser_pending(x_bridge_token: str | None = Header(default=None)):
+    @app.get("/api/browser/pending")
+    async def browser_pending(x_bridge_token: str | None = Header(default=None)) -> dict:
         bridge_auth(x_bridge_token)
-        return {'job': llm.pending}
+        return {"job": llm.pending}
 
-    @app.post('/api/browser/result/{job_id}')
-    async def browser_result(job_id: str, payload: BridgeResponse, x_bridge_token: str | None = Header(default=None)):
+    @app.post("/api/browser/result/{job_id}")
+    async def browser_result(
+        job_id: str,
+        payload: BridgeResponse,
+        x_bridge_token: str | None = Header(default=None),
+    ) -> dict:
         bridge_auth(x_bridge_token)
         try:
             llm.complete(job_id, payload.answer, payload.error)
         except ValueError as exc:
             raise HTTPException(409, str(exc))
-        return {'ok': True}
+        return {"ok": True}
 
     @app.get("/health")
     async def health() -> dict:
-        return {"ok": True, "glm_mode": cfg.glm_mode, "db_path": cfg.db_path}
+        return {
+            "ok": True,
+            "glm_mode": cfg.glm_mode,
+            "db_path": cfg.db_path,
+            "approval_required": cfg.agent_require_approval,
+            "agent_max_steps": cfg.agent_max_steps,
+        }
 
     @app.post("/api/chat")
     async def chat(payload: ChatRequest) -> dict:
+        """Compatibility endpoint. The primary UI now routes requests through the agent."""
         try:
-            memories = await asyncio.to_thread(retriever.search, payload.question, cfg.top_k_context)
+            memories = await asyncio.to_thread(
+                retriever.search, payload.question, cfg.top_k_context
+            )
             prompt = build_prompt(payload.question, memories)
             answer = await llm.generate(prompt)
         except Exception as exc:
@@ -118,7 +143,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/memory/search")
     async def memory_search(q: str, limit: int = 5) -> dict:
-        return {"items": await asyncio.to_thread(retriever.search, q, max(1, min(limit, 20)))}
+        return {
+            "items": await asyncio.to_thread(
+                retriever.search, q, max(1, min(limit, 20))
+            )
+        }
 
     @app.get("/api/history")
     async def history(limit: int = 20) -> dict:
@@ -126,7 +155,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/knowledge")
     async def knowledge(payload: KnowledgeRequest) -> dict:
-        knowledge_id = memory.add_knowledge(payload.rule, payload.confidence, payload.status)
+        knowledge_id = memory.add_knowledge(
+            payload.rule, payload.confidence, payload.status
+        )
         return {"knowledge_id": knowledge_id}
 
     @app.post("/api/reflection")
@@ -142,10 +173,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/agent/plan")
     async def agent_plan(payload: AgentRequest) -> dict:
-        return {"goal": payload.question, "steps": [
-            "선택한 Skill과 과거 기억 확인", "필요한 파일·폴더·Git·터미널 도구 실행",
-            "각 결과 검증", "근거와 생성 파일을 포함한 최종 답변"
-        ], "approval_required": cfg.agent_require_approval}
+        return {
+            "goal": payload.question,
+            "steps": [
+                "관련 기억과 Skill 확인",
+                "필요한 파일·폴더·Git·터미널 도구 실행",
+                "도구 결과 검증",
+                "근거와 생성 파일을 포함한 최종 답변",
+            ],
+            "approval_required": cfg.agent_require_approval,
+        }
 
     @app.post("/api/agent/runs/{run_id}/approve")
     async def agent_approve(run_id: str) -> dict:
@@ -170,21 +207,41 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/skills")
     async def skills() -> dict:
-        return {"items": agent.skills.list(), "allowed_roots": [str(p) for p in agent.allowed_roots]}
+        return {
+            "items": agent.skills.list(),
+            "allowed_roots": [str(p) for p in agent.allowed_roots],
+        }
 
     @app.get("/api/capabilities")
     async def capabilities() -> dict:
-        return {"tools": ["memory_search", "read_file", "write_file", "create_directory", "run_command", "git_status", "git_diff", "git_log", "git_commit", "write_report", "save_skill"], "approval_required": cfg.agent_require_approval, "workspace": str(agent.root)}
+        return {
+            "tools": [
+                "memory_search",
+                "read_file",
+                "write_file",
+                "create_directory",
+                "run_command",
+                "git_status",
+                "git_diff",
+                "git_log",
+                "git_commit",
+                "write_report",
+                "save_skill",
+            ],
+            "approval_required": cfg.agent_require_approval,
+            "workspace": str(agent.root),
+        }
 
     @app.get("/api/workspace")
     async def workspace() -> dict:
-        files = [p.name for p in agent.root.iterdir() if not p.name.startswith('.')]
+        files = [p.name for p in agent.root.iterdir() if not p.name.startswith(".")]
         return {"path": str(agent.root), "files": files[:100]}
 
     @app.post("/api/workspace/open")
     async def open_workspace() -> dict:
-        # The path is resolved from the configured allow-list, never from user input.
-        await asyncio.to_thread(subprocess.Popen, ["explorer.exe", str(agent.root)], shell=False)
+        await asyncio.to_thread(
+            subprocess.Popen, ["explorer.exe", str(agent.root)], shell=False
+        )
         return {"ok": True, "path": str(agent.root)}
 
     @app.get("/api/agent/runs/{run_id}")
@@ -198,8 +255,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def agent_runs(limit: int = 20) -> dict:
         limit = max(1, min(limit, 100))
         with db.connect() as conn:
-            rows = conn.execute("SELECT payload FROM agent_runs ORDER BY rowid DESC LIMIT ?", (limit,)).fetchall()
-        import json
+            rows = conn.execute(
+                "SELECT payload FROM agent_runs ORDER BY rowid DESC LIMIT ?", (limit,)
+            ).fetchall()
         return {"items": [json.loads(row["payload"]) for row in rows]}
 
     @app.post("/api/embeddings/reindex")
@@ -215,7 +273,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return {"ok": False, "message": "임베딩이 꺼져 있습니다"}
         try:
             vectors = await asyncio.to_thread(retriever.encoder.encode, ["연결 진단"])
-            return {"ok": True, "dimensions": len(vectors[0]), "mode": cfg.embedding_mode}
+            return {
+                "ok": True,
+                "dimensions": len(vectors[0]),
+                "mode": cfg.embedding_mode,
+            }
         except Exception as exc:
             return {"ok": False, "message": str(exc)}
 
@@ -228,104 +290,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return Response(status_code=204)
 
     return app
-
-
-INDEX_HTML = r"""
-<!doctype html>
-<html lang="ko">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>LOCAL_LLM Memory Agent</title>
-<style>
-:root{font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;color:#16202a;background:#f3f6f8;line-height:1.5}
-*{box-sizing:border-box}body{max-width:1120px;margin:0 auto;padding:28px 22px 56px}.hero{display:flex;justify-content:space-between;align-items:flex-start;gap:20px;margin-bottom:22px}.eyebrow{font-size:12px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:#167c70}.hero h1{font-size:34px;line-height:1.15;margin:6px 0}.status{border:1px solid #c9d8dc;background:#fff;border-radius:999px;padding:8px 12px;font-size:13px}.muted{color:#60707c;font-size:14px}.card{background:#fff;border:1px solid #dbe4e7;border-radius:16px;padding:20px;margin-bottom:16px;box-shadow:0 8px 24px #263b4510}.card h2,.card h3{margin:0 0 10px}.card h2{font-size:20px}.card h3{font-size:16px}textarea,input,select{width:100%;box-sizing:border-box;padding:13px;border:1px solid #b9c8cd;border-radius:10px;background:#fbfcfc;font:inherit}textarea{min-height:130px;resize:vertical}label{display:block;font-size:13px;font-weight:650;margin-top:12px}button{min-height:42px;padding:10px 15px;margin:10px 6px 0 0;border:1px solid #c4d1d5;border-radius:10px;background:#fff;color:#17252a;cursor:pointer;font-weight:650}button:hover{border-color:#167c70;background:#f0faf8}button:focus-visible,textarea:focus-visible,select:focus-visible{outline:3px solid #83d7c8;outline-offset:2px}.primary{background:#126e64;border-color:#126e64;color:white}.primary:hover{background:#0d594f;color:white}.answer{white-space:pre-wrap;overflow-wrap:anywhere}.memory{font-size:14px;border-top:1px solid #edf1f2;padding-top:8px;margin-top:8px}.cap{display:flex;gap:10px;align-items:flex-start;padding:10px 0;border-top:1px solid #edf1f2}.cap b{font-size:14px}.cap span{font-size:13px;color:#60707c}.pill{display:inline-block;background:#e7f5f2;color:#126e64;border-radius:999px;padding:3px 8px;font-size:12px}.small{font-size:12px}@media(max-width:800px){body{padding:18px 14px}.hero{display:block}.status{display:inline-block;margin-top:10px}.hero h1{font-size:28px}}
-</style>
-</head>
-<body>
-<div class="hero"><div><div class="eyebrow">Local work agent</div><h1>LOCAL_LLM Agent</h1><p class="muted">Gemini의 판단과 내 PC의 승인된 도구를 연결합니다.</p></div><div class="status" id="mode">연결 상태 확인 중</div></div>
-<p class="muted">한 단계마다 Gemini가 다음 행동을 정하므로 파일 읽기·쓰기·검증 요청은 3~6회 질문처럼 보일 수 있습니다. 최대 8단계이며 같은 호출 3회 반복 시 안전하게 중단합니다.</p>
-<div class="card"><h3>처음 사용하는 방법</h3>
-<ol><li>Skill을 선택하거나 <b>자동 선택</b>을 둡니다.</li><li>작업 폴더에 참고할 UTF-8 텍스트 파일을 넣습니다.</li><li>구체적으로 요청합니다. 예: <code>experiment.txt를 읽고 원인 가설 보고서를 새 파일로 만들어줘</code></li><li><b>에이전트 실행</b>을 누르고, 생성된 파일과 답변을 확인합니다.</li></ol>
-<p class="muted">에이전트는 최대 8단계로 memory_search, list_files, read_file, create_directory, write_file, write_report를 실행할 수 있습니다. 기존 파일 덮어쓰기·삭제·임의 셸 실행은 차단됩니다.</p></div>
-<div class="card"><h3>내 작업 폴더</h3><p class="muted">에이전트가 읽고 새 결과물을 만들 수 있는 폴더입니다.</p><button onclick="openWorkspace()">폴더 열기</button><button onclick="showWorkspace()">파일 목록 보기</button><pre id="workspace" class="small"></pre></div>
-<div class="card"><h3>에이전트가 할 수 있는 일</h3><p class="muted">기억 검색 · 파일/폴더 생성 · 터미널과 Git 확인 · 보고서 작성 · Skill 저장</p><p class="muted small">기존 파일 수정·삭제, 위험 명령, 설비 조작과 메일 전송은 기본 차단됩니다. 승인 설정이 켜져 있으면 변경 작업 전에 승인 버튼이 나타납니다.</p></div>
-<div class="card">
-<textarea id="q" placeholder="예: Air Dome Zone 3 압력을 올렸는데 C5가 반대로 움직였어. 원인이 뭘까?"></textarea>
-<button class="primary" onclick="ask()">질문하기</button>
-<label>Skill <select id="skill"><option value="">자동 선택</option></select></label>
-<button onclick="runAgent(this)">에이전트 실행</button>
-<pre id="agentResult" style="white-space:pre-wrap"></pre>
-</div>
-<div class="card" id="result" style="display:none">
-<h3>답변</h3><div id="answer" class="answer"></div>
-<div id="memories"></div>
-<input id="note" placeholder="실제 결과/메모 (선택)" />
-<button onclick="feedback('resolved')">✓ 해결됨</button>
-<button onclick="feedback('failed')">✕ 실패</button>
-<button onclick="feedback('important')">★ 중요지식</button>
-</div>
-<div class="card">
-<h3>연결 진단</h3><button onclick="diagnose()">로컬 임베딩 진단</button><button onclick="reindex()">기억 임베딩 갱신</button><pre id="diagnostic"></pre>
-<h3>자기개선 Reflection</h3>
-<p class="muted">누적된 해결/실패 case를 GLM이 다시 비교해 재사용 가능한 knowledge candidate를 만듭니다.</p>
-<button onclick="reflectNow()">Reflection 실행</button>
-<div id="reflection" class="answer"></div>
-</div>
-<script>
-let currentId=null;
-fetch('/health').then(r=>r.json()).then(d=>document.getElementById('mode').textContent=d.glm_mode==='browser_bridge'?'Gemini 브리지 연결':'GLM '+d.glm_mode).catch(()=>document.getElementById('mode').textContent='서버 연결 오류');
-async function openWorkspace(){const r=await fetch('/api/workspace/open',{method:'POST'});const d=await r.json();document.getElementById('workspace').textContent=d.path||d.detail;}
-async function showWorkspace(){const r=await fetch('/api/workspace');const d=await r.json();document.getElementById('workspace').textContent=d.path+'\n'+d.files.join('\n');}
-fetch('/api/skills').then(r=>r.json()).then(d=>{d.items.forEach(s=>{const o=document.createElement('option');o.value=s.name;o.textContent=s.name;document.getElementById('skill').appendChild(o);});});
-async function request(url,body){
- const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
- if(!r.ok)throw new Error(await r.text()); return r.json();
-}
-async function runAgent(button){
- const question=document.getElementById('q').value.trim(); if(!question)return;
- button.disabled=true; const box=document.getElementById('agentResult');box.textContent='계획 및 도구 실행 중...';
- try {const plan=await request('/api/agent/plan',{question,skill:document.getElementById('skill').value||null});
- box.textContent='Plan 단계:\n'+plan.steps.map((x,i)=>(i+1)+'. '+x).join('\n')+'\n\n실행 중...';
- const d=await request('/api/agent/run',{question,skill:document.getElementById('skill').value||null});currentId=d.conversation_id||null;
- box.textContent='실행 상태: '+d.status+' / ID: '+d.id+'\n'+d.steps.map((s,i)=>'단계 '+(i+1)+': '+JSON.stringify(s)).join('\n')+'\n'+(d.answer||d.error||'');
- if(d.status==='awaiting_approval'){
-   const approve=document.createElement('button'); approve.textContent='이 작업 승인'; approve.onclick=()=>continueAgent(d.id,'approve');
-   const deny=document.createElement('button'); deny.textContent='거부'; deny.onclick=()=>continueAgent(d.id,'deny'); box.append('\\n',approve,deny);
- }
- if(d.conversation_id){document.getElementById('result').style.display='block';document.getElementById('answer').textContent=d.answer;document.getElementById('memories').textContent='';}
- }catch(e){box.textContent=e.message;}finally{button.disabled=false;}
-}
-async function continueAgent(id, action){
- const r=await fetch('/api/agent/runs/'+id+'/'+action,{method:'POST'}); const d=await r.json();
- document.getElementById('agentResult').textContent='실행 상태: '+d.status+' / ID: '+d.id+'\\n'+d.steps.map((s,i)=>'단계 '+(i+1)+': '+JSON.stringify(s)).join('\\n')+'\\n'+(d.answer||d.error||'');
-}
-async function diagnose(){try{document.getElementById('diagnostic').textContent=JSON.stringify(await request('/api/diagnostics/embedding',{}),null,2);}catch(e){document.getElementById('diagnostic').textContent=e.message;}}
-async function reindex(){try{document.getElementById('diagnostic').textContent=JSON.stringify(await request('/api/embeddings/reindex',{}));}catch(e){document.getElementById('diagnostic').textContent=e.message;}}
-
-async function ask(){
-  const question=document.getElementById('q').value.trim(); if(!question)return;
-  const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question})});
-  if(!r.ok){alert(await r.text());return;}
-  const d=await r.json(); currentId=d.conversation_id;
-  document.getElementById('result').style.display='block'; document.getElementById('answer').textContent=d.answer;
-  const m=document.getElementById('memories'); m.innerHTML='<h4>자동으로 참고한 과거 기록 '+d.memory_hits.length+'개</h4>';
-  d.memory_hits.forEach(x=>{const e=document.createElement('div');e.className='memory';e.textContent='['+x.source+'] '+x.title;m.appendChild(e);});
-}
-async function feedback(status){
-  if(!currentId)return; const note=document.getElementById('note').value;
-  const r=await fetch('/api/feedback/'+currentId,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status,note})});
-  if(r.ok) alert('저장되었습니다: '+status); else alert('저장 실패');
-}
-async function reflectNow(){
-  const box=document.getElementById('reflection'); box.textContent='분석 중...';
-  const r=await fetch('/api/reflection',{method:'POST'}); const d=await r.json();
-  box.textContent='분석 case: '+d.case_count+'개 / 생성 knowledge: '+d.created.length+'개\n'+d.created.map(x=>'• '+x.rule+' (confidence '+x.confidence+')').join('\n');
-}
-</script>
-</body>
-</html>
-"""
 
 
 app = create_app()
