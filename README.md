@@ -1,35 +1,40 @@
 # LOCAL_LLM Memory Agent
 
-사내에서 API 없이 웹사이트 형태로만 사용할 수 있는 GLM을 `Playwright + SQLite Memory` 앞단으로 감싸서, 사용할수록 과거 대화/사례/지식 규칙을 재활용하는 로컬 엔지니어링 에이전트입니다.
+사내에서 API 없이 웹사이트 형태로만 사용할 수 있는 LLM을 Selenium/Playwright/Browser Bridge와 SQLite Memory 앞단으로 감싸서, 사용할수록 과거 대화·사례·검증 지식을 재활용하는 로컬 엔지니어링 에이전트입니다.
 
-## 현재 MVP 기능
+## 현재 기능
 
+- Chat-first Agent UI
 - 질문/답변 자동 저장
-- SQLite FTS5 기반 과거 대화·사례·지식 검색
-- 질문 전 관련 기억 TOP-K 자동 검색
-- 검색 결과를 GLM 프롬프트에 자동 삽입
-- `해결됨 / 실패 / 중요지식` 피드백 저장
-- 해결/실패 대화를 별도 case로 승격
-- 누적 case를 GLM이 재분석해 `knowledge candidate`를 만드는 Reflection
-- 매일 Reflection을 실행할 수 있는 스크립트
-- 실제 GLM 없이 검증 가능한 mock 모드
-- 회사 GLM 웹사이트용 Playwright adapter
-- 간단한 로컬 웹 UI
+- SQLite FTS5 기반 과거 대화·사례·Knowledge 검색
+- 선택적 로컬 embedding hybrid 검색
+- 해결/실패/중요지식 피드백
+- case → Reflection → Knowledge candidate
+- 중복 Knowledge 병합, 충돌 격리, 근거 Case 추적
+- 검증된 Knowledge 검색 우선순위 상승
+- 작업 폴더 파일 읽기/생성, 보고서, 제한된 Python/Git 도구
+- 변경 작업 사용자 승인
+- Skill 읽기/생성
+- 회사 GLM 연결: Selenium / Playwright / Browser Bridge
 - GitHub Actions 자동 테스트
 
 ## 구조
 
 ```text
-Browser -> FastAPI -> Memory Retriever -> Prompt Builder -> GLM Adapter
-                         |                                  |
-                         +---------- SQLite FTS5 <----------+
-                                      ^
-                                      |
-                         Case -> Reflection -> Knowledge
+Browser -> FastAPI -> Agent -> Memory Retriever -> GLM Adapter
+                       |          |                |
+                       |          +-- SQLite FTS5 -+
+                       |          +-- Embedding(optional)
+                       |
+                       +-- Files / Reports / Python / Git / Skills
+
+Case -> Reflection -> Candidate Knowledge -> validation/conflict handling
 
 GLM Adapter
   - mock
-  - playwright -> 사내 GLM Web
+  - selenium      -> 회사 GLM Web (현재 회사 권장)
+  - playwright    -> 회사 GLM Web
+  - browser_bridge-> 이미 열린 회사 브라우저
 ```
 
 ## Windows 설치
@@ -43,87 +48,64 @@ pip install -r requirements.txt
 copy .env.example .env
 ```
 
-Playwright 실제 웹 연결을 쓸 경우 한 번만 실행합니다.
+## 회사 PC: Selenium 연결
 
-```bat
-playwright install chromium
+실제 사내 URL은 공개 GitHub에 넣지 말고 로컬 `.env`에만 저장합니다.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\setup_company_selenium.ps1 -GlmUrl "http://YOUR-INTERNAL-LLM:8501/"
 ```
 
-## 먼저 mock 모드로 실행
-
-`.env`에서 아래 상태를 유지합니다.
+이 스크립트는 로컬 `.env`를 다음 방향으로 설정합니다.
 
 ```env
-LOCAL_LLM_GLM_MODE=mock
+LOCAL_LLM_GLM_MODE=selenium
+LOCAL_LLM_GLM_URL=http://YOUR-INTERNAL-LLM:8501/
+LOCAL_LLM_GLM_TIMEOUT_MS=1800000
+LOCAL_LLM_EMBEDDING_MODE=disabled
 ```
+
+Selenium adapter는 브라우저를 첫 요청 때 띄우고, 클립보드 `Ctrl+V`로 프롬프트를 입력합니다. 답변 끝의 `[[END]]` 마커를 확인해 응답 잘림을 감지하고, 마커가 없으면 자동 이어쓰기를 시도합니다. Chrome을 먼저 사용하고 실패하면 Edge를 시도합니다.
 
 실행:
 
 ```bat
-uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
-브라우저에서 `http://127.0.0.1:8000` 접속 후 질문을 입력합니다.
+브라우저에서 `http://127.0.0.1:8000`을 엽니다.
 
-첫 질문은 memory hit가 0개일 수 있습니다. 답변 후 `해결됨`을 누르고 실제 결과를 메모한 다음 비슷한 두 번째 질문을 하면, 첫 질문 또는 승격된 case가 자동으로 검색되어 GLM용 프롬프트에 포함됩니다.
+상세 회사 설정은 [회사 PC 연결 가이드](docs/COMPANY_SETUP.md)를 참고하세요.
 
-## 자기개선 Reflection
+## 긴 문서 지원
 
-`해결됨` 또는 `실패` 피드백이 들어간 대화는 case가 됩니다. Reflection은 최근 case들을 GLM에 다시 보내 공통 패턴/조건 차이를 분석하고 `knowledge candidate`를 생성합니다.
+회사 업무용 긴 텍스트를 위해 다음 제한을 24만 글자로 높였습니다.
 
-웹 화면에서 `Reflection 실행` 버튼을 눌러 실행하거나 API로 호출할 수 있습니다.
+- 채팅 질문: 240,000자
+- `read_file`: 240,000자
+- `write_file`: 240,000자
+- `write_report`: 240,000자
+- 다음 Agent step에 전달되는 도구 결과: 240,000자
+
+현재 직접 읽는 파일은 UTF-8 텍스트 계열(TXT/MD/CSV/JSON/PY/JS/HTML/CSS/YAML)입니다. XLSX/PDF 등은 별도 reader 확장이 필요합니다.
+
+## Memory 자료 폴더
+
+개인 업무 기억이나 과거 자료는 우선 아래에 정리하는 것을 권장합니다.
 
 ```text
-POST /api/reflection
+data/workspace/memory/
 ```
 
-또는 CLI:
+`setup_company_selenium.ps1`도 이 폴더를 자동 생성합니다. 단, 현재는 폴더에 파일을 넣는 것만으로 Memory DB에 자동 색인되지는 않으며 Agent가 작업 파일로 읽어 활용합니다.
 
-```bat
-python scripts\daily_reflection.py
-```
+실제 Memory DB는 `data/memory.db`이며 직접 편집하지 않습니다.
 
-Windows 작업 스케줄러에 위 명령을 하루 1회 등록하면 매일 자동 Reflection이 가능합니다. 회사 GLM을 실제로 사용할 때는 `.env`의 `LOCAL_LLM_GLM_MODE=playwright` 설정을 그대로 사용합니다.
+## 자기개선
 
-## 회사 GLM 웹사이트 연결
+사용자가 완료 답변에 `해결됨 / 실패 / 중요지식` 피드백을 남기면 사례가 누적됩니다. Reflection은 실제 Case를 비교해 재사용 가능한 Knowledge를 만들고, 동일 지식은 병합하며 충돌하는 지식은 격리합니다. 서로 다른 실제 Case 근거와 confidence 기준을 만족한 Knowledge는 validated로 승격되어 검색 우선순위가 높아집니다.
 
-`.env`를 아래처럼 변경합니다. 회사 URL/DOM selector는 저장소에 직접 커밋하지 않는 것을 권장합니다.
-
-```env
-LOCAL_LLM_GLM_MODE=playwright
-LOCAL_LLM_GLM_URL=https://YOUR_INTERNAL_GLM/
-LOCAL_LLM_GLM_INPUT_SELECTOR=textarea
-LOCAL_LLM_GLM_SUBMIT_SELECTOR=
-LOCAL_LLM_GLM_RESPONSE_SELECTOR=[data-message-author-role='assistant']
-LOCAL_LLM_GLM_USER_DATA_DIR=.browser-profile
-LOCAL_LLM_GLM_HEADLESS=false
-```
-
-- `GLM_INPUT_SELECTOR`: 질문 입력창 CSS selector
-- `GLM_SUBMIT_SELECTOR`: 전송 버튼 selector. 비워두면 Enter로 전송
-- `GLM_RESPONSE_SELECTOR`: assistant 답변 블록 selector
-- `.browser-profile`: 로그인 세션을 유지하는 로컬 Chromium profile
-
-회사 GLM 페이지의 실제 selector를 확인한 뒤 위 3개 값만 맞추면 됩니다.
-
-## API
-
-- `POST /api/chat` : 기억 검색 -> 프롬프트 조립 -> GLM 호출 -> 대화 저장
-- `POST /api/feedback/{conversation_id}` : resolved / failed / important 저장
-- `POST /api/reflection` : case 재분석 -> knowledge candidate 생성
-- `GET /api/memory/search?q=...` : 기억 검색 확인
-- `GET /api/history` : 최근 대화
-- `POST /api/knowledge` : 수동 지식 규칙 추가
-- `GET /health` : 상태 확인
-
-예시:
-
-```json
-POST /api/chat
-{
-  "question": "Air Dome Zone3 압력을 올렸는데 C5가 반대로 움직였어. 왜 그럴까?"
-}
-```
+이는 현재 모델 가중치 재학습이 아니라 Memory/Knowledge 기반 자기개선입니다.
 
 ## 테스트
 
@@ -131,27 +113,4 @@ POST /api/chat
 pytest -q
 ```
 
-현재 테스트는 다음 흐름을 확인합니다.
-
-1. 질문/답변 저장
-2. FTS5 검색
-3. `resolved` 피드백
-4. case 자동 생성
-5. 다음 유사 질문에서 과거 memory 재검색
-6. Reflection으로 knowledge candidate 생성
-7. 생성된 knowledge가 다시 검색되는지 확인
-8. FastAPI chat/feedback/reflection/health API
-
-## 다음 단계
-
-1. Knowledge confidence/evidence 자동 누적 및 충돌 관리
-2. FTS5 + embedding hybrid 검색
-3. 과거 문제를 이용한 Eval set 자동 생성
-4. GLM 답변 품질 추세 대시보드
-5. 반복 작업을 Skill 파일로 자동 승격
-
-## 에이전트 및 로컬 임베딩 확장
-
-계획 → 도구 실행 → 결과 검토 반복, 실행 기록 저장, 작업 폴더 파일 읽기/보고서 생성, FTS5+로컬 임베딩 검색을 지원합니다.
-
-설치와 내일 회사에서의 연결 순서, 모델 형식 및 제한은 [회사 PC 연결 가이드](docs/COMPANY_SETUP.md)를 참고하세요. 실제 회사 모델과 GLM 웹은 현장 검증이 필요합니다.
+GitHub Actions에서도 동일 테스트를 실행합니다.
