@@ -110,3 +110,11 @@ class MemoryStore:
                 (limit,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def recent_cases(self, limit: int = 50) -> list[dict[str, Any]]:
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                "SELECT id, created_at, problem, solution, outcome, status, tags FROM cases ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
