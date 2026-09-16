@@ -1,6 +1,6 @@
 import asyncio
 import secrets
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Response
 from app.llm.browser_bridge import BrowserBridge
 from app.agent import Agent
 from app.embeddings import LocalEmbeddings, HybridRetriever
@@ -178,6 +178,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/", response_class=HTMLResponse)
     async def home() -> str:
         return INDEX_HTML
+
+    @app.get("/favicon.ico")
+    async def favicon() -> Response:
+        return Response(status_code=204)
 
     return app
 
