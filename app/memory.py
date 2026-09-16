@@ -9,6 +9,14 @@ SEARCHABLE_KNOWLEDGE_STATUSES = {"candidate", "validated"}
 KNOWLEDGE_STATUSES = SEARCHABLE_KNOWLEDGE_STATUSES | {"conflicted", "rejected"}
 AUTO_VALIDATE_CONFIDENCE = 0.72
 AUTO_VALIDATE_EVIDENCE = 2
+OPPOSITE_PAIRS = (
+    ("증가", "감소"),
+    ("상승", "하락"),
+    ("높", "낮"),
+    ("성공", "실패"),
+    ("가능", "불가능"),
+    ("필요", "불필요"),
+)
 
 
 class MemoryStore:
@@ -19,12 +27,20 @@ class MemoryStore:
     @staticmethod
     def _fts_query(text: str) -> str:
         tokens = re.findall(r"[0-9A-Za-z가-힣_]+", text)
-        tokens = [t for t in tokens if len(t) > 1][:12]
-        return " OR ".join(f'"{t}"' for t in tokens)
+        tokens = [token for token in tokens if len(token) > 1][:12]
+        return " OR ".join(f'"{token}"' for token in tokens)
 
     @staticmethod
     def normalize_rule(text: str) -> str:
         return "".join(re.findall(r"[0-9a-z가-힣]+", text.lower()))
+
+    @staticmethod
+    def _has_opposite_terms(left: str, right: str) -> bool:
+        left, right = left.lower(), right.lower()
+        return any(
+            (a in left and b in right) or (b in left and a in right)
+            for a, b in OPPOSITE_PAIRS
+        )
 
     @classmethod
     def rule_similarity(cls, left: str, right: str) -> float:
@@ -38,7 +54,10 @@ class MemoryStore:
         tb = set(re.findall(r"[0-9A-Za-z가-힣_]+", right.lower()))
         union = ta | tb
         jaccard = len(ta & tb) / len(union) if union else 0.0
-        return max(sequence * 0.75 + jaccard * 0.25, jaccard)
+        score = max(sequence * 0.75 + jaccard * 0.25, jaccard)
+        if cls._has_opposite_terms(left, right):
+            return min(score, 0.70)
+        return score
 
     def _repair_knowledge_fts(self) -> None:
         with self.db.connect() as conn:
@@ -125,7 +144,7 @@ class MemoryStore:
         statuses = list(statuses or [])
         with self.db.connect() as conn:
             if statuses:
-                valid = [s for s in statuses if s in KNOWLEDGE_STATUSES]
+                valid = [status for status in statuses if status in KNOWLEDGE_STATUSES]
                 if not valid:
                     return []
                 placeholders = ",".join("?" for _ in valid)
@@ -144,42 +163,66 @@ class MemoryStore:
         if status not in KNOWLEDGE_STATUSES:
             raise ValueError("invalid knowledge status")
         with self.db.connect() as conn:
-            if conn.execute("SELECT 1 FROM knowledge WHERE id=?", (knowledge_id,)).fetchone() is None:
+            if conn.execute(
+                "SELECT 1 FROM knowledge WHERE id=?", (knowledge_id,)
+            ).fetchone() is None:
                 raise KeyError(knowledge_id)
-            conn.execute("UPDATE knowledge SET status=? WHERE id=?", (status, knowledge_id))
+            conn.execute(
+                "UPDATE knowledge SET status=? WHERE id=?", (status, knowledge_id)
+            )
             self._sync_knowledge_fts(conn, knowledge_id)
         return self.get_knowledge(knowledge_id)
 
-    def find_similar_knowledge(self, rule: str, threshold: float = 0.93) -> dict[str, Any] | None:
-        rows = self.list_knowledge(200, ("candidate", "validated"))
+    @classmethod
+    def _best_similar(cls, rule: str, rows, threshold: float = 0.93):
         best = None
         best_score = 0.0
         for row in rows:
-            score = self.rule_similarity(rule, row["rule"])
+            score = cls.rule_similarity(rule, row["rule"])
             if score > best_score:
                 best, best_score = row, score
         if best is not None and best_score >= threshold:
-            return {**best, "similarity": best_score}
+            return {**dict(best), "similarity": best_score}
         return None
 
-    def _valid_case_ids(self, conn, case_ids: list[int] | tuple[int, ...]) -> list[int]:
-        unique = sorted({int(x) for x in case_ids if int(x) > 0})
+    def find_similar_knowledge(
+        self, rule: str, threshold: float = 0.93
+    ) -> dict[str, Any] | None:
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                "SELECT id, rule, confidence, evidence_count, status FROM knowledge WHERE status IN ('candidate','validated')"
+            ).fetchall()
+        return self._best_similar(rule, rows, threshold)
+
+    @staticmethod
+    def _valid_case_ids(conn, case_ids) -> list[int]:
+        unique = set()
+        for value in case_ids:
+            try:
+                case_id = int(value)
+            except (TypeError, ValueError):
+                continue
+            if case_id > 0:
+                unique.add(case_id)
         if not unique:
             return []
-        placeholders = ",".join("?" for _ in unique)
+        ordered = sorted(unique)
+        placeholders = ",".join("?" for _ in ordered)
         rows = conn.execute(
-            f"SELECT id FROM cases WHERE id IN ({placeholders})", unique
+            f"SELECT id FROM cases WHERE id IN ({placeholders})", ordered
         ).fetchall()
         return [int(row["id"]) for row in rows]
 
     @staticmethod
-    def _promoted_status(status: str, confidence: float, evidence_count: int) -> str:
+    def _promoted_status(
+        status: str, confidence: float, tracked_case_count: int
+    ) -> str:
         if status == "validated":
             return status
         if (
             status == "candidate"
             and confidence >= AUTO_VALIDATE_CONFIDENCE
-            and evidence_count >= AUTO_VALIDATE_EVIDENCE
+            and tracked_case_count >= AUTO_VALIDATE_EVIDENCE
         ):
             return "validated"
         return status
@@ -188,7 +231,7 @@ class MemoryStore:
         self,
         rule: str,
         confidence: float,
-        evidence_case_ids: list[int] | tuple[int, ...] = (),
+        evidence_case_ids=(),
         relation: str = "new",
         target_knowledge_id: int | None = None,
     ) -> dict[str, Any]:
@@ -196,10 +239,11 @@ class MemoryStore:
         if not rule:
             raise ValueError("knowledge rule is required")
         confidence = min(1.0, max(0.0, float(confidence)))
-        relation = relation if relation in {"new", "duplicate", "supports", "conflicts"} else "new"
+        if relation not in {"new", "duplicate", "supports", "conflicts"}:
+            relation = "new"
 
         with self.db.connect() as conn:
-            valid_case_ids = self._valid_case_ids(conn, list(evidence_case_ids))
+            valid_case_ids = self._valid_case_ids(conn, evidence_case_ids)
             target = None
             if target_knowledge_id is not None:
                 target = conn.execute(
@@ -208,38 +252,39 @@ class MemoryStore:
                 ).fetchone()
 
             duplicate = None
-            if target is not None and relation == "duplicate":
-                if self.rule_similarity(rule, target["rule"]) >= 0.72:
+            if relation != "conflicts":
+                if (
+                    target is not None
+                    and target["status"] in SEARCHABLE_KNOWLEDGE_STATUSES
+                    and relation == "duplicate"
+                    and self.rule_similarity(rule, target["rule"]) >= 0.72
+                ):
                     duplicate = dict(target)
-            if duplicate is None:
-                candidate = self.find_similar_knowledge(rule)
-                if candidate is not None:
-                    duplicate = candidate
+                if duplicate is None:
+                    rows = conn.execute(
+                        "SELECT id, rule, confidence, evidence_count, status FROM knowledge WHERE status IN ('candidate','validated')"
+                    ).fetchall()
+                    duplicate = self._best_similar(rule, rows)
 
             if duplicate is not None:
                 knowledge_id = int(duplicate["id"])
-                before = conn.execute(
-                    "SELECT COUNT(DISTINCT case_id) AS n FROM knowledge_evidence WHERE knowledge_id=? AND relation='supports'",
-                    (knowledge_id,),
-                ).fetchone()["n"]
                 for case_id in valid_case_ids:
                     conn.execute(
                         "INSERT OR IGNORE INTO knowledge_evidence(knowledge_id, case_id, relation) VALUES (?, ?, 'supports')",
                         (knowledge_id, case_id),
                     )
-                after = conn.execute(
-                    "SELECT COUNT(DISTINCT case_id) AS n FROM knowledge_evidence WHERE knowledge_id=? AND relation='supports'",
-                    (knowledge_id,),
-                ).fetchone()["n"]
-                newly_added = max(0, int(after) - int(before))
+                tracked_count = int(
+                    conn.execute(
+                        "SELECT COUNT(DISTINCT case_id) AS n FROM knowledge_evidence WHERE knowledge_id=? AND relation='supports'",
+                        (knowledge_id,),
+                    ).fetchone()["n"]
+                )
                 evidence_count = max(
-                    int(duplicate["evidence_count"]) + newly_added,
-                    int(after),
-                    1,
+                    int(duplicate["evidence_count"]), tracked_count, 1
                 )
                 merged_confidence = max(float(duplicate["confidence"]), confidence)
                 status = self._promoted_status(
-                    str(duplicate["status"]), merged_confidence, evidence_count
+                    str(duplicate["status"]), merged_confidence, tracked_count
                 )
                 conn.execute(
                     "UPDATE knowledge SET confidence=?, evidence_count=?, status=? WHERE id=?",
@@ -252,12 +297,18 @@ class MemoryStore:
                     "rule": duplicate["rule"],
                     "confidence": merged_confidence,
                     "evidence_count": evidence_count,
+                    "tracked_case_count": tracked_count,
                     "status": status,
                 }
 
-            status = "conflicted" if target is not None and relation == "conflicts" else "candidate"
-            evidence_count = max(1, len(valid_case_ids))
-            status = self._promoted_status(status, confidence, evidence_count)
+            status = (
+                "conflicted"
+                if target is not None and relation == "conflicts"
+                else "candidate"
+            )
+            tracked_count = len(valid_case_ids)
+            evidence_count = max(1, tracked_count)
+            status = self._promoted_status(status, confidence, tracked_count)
             cur = conn.execute(
                 "INSERT INTO knowledge(rule, confidence, evidence_count, status) VALUES (?, ?, ?, ?)",
                 (rule, confidence, evidence_count, status),
@@ -280,6 +331,7 @@ class MemoryStore:
                 "rule": rule,
                 "confidence": confidence,
                 "evidence_count": evidence_count,
+                "tracked_case_count": tracked_count,
                 "status": status,
                 "relation": relation,
                 "target_knowledge_id": int(target["id"]) if target is not None else None,
@@ -288,7 +340,6 @@ class MemoryStore:
     def set_feedback(self, conversation_id: int, status: str, note: str = "") -> None:
         if status not in {"resolved", "failed", "important"}:
             raise ValueError("status must be resolved, failed, or important")
-
         with self.db.connect() as conn:
             row = conn.execute(
                 "SELECT question, answer FROM conversations WHERE id=?",
@@ -296,43 +347,40 @@ class MemoryStore:
             ).fetchone()
             if row is None:
                 raise KeyError(conversation_id)
-
             conn.execute(
                 "UPDATE conversations SET feedback=?, feedback_note=?, importance=? WHERE id=?",
                 (status, note, 1 if status == "important" else 0, conversation_id),
             )
-
-            if status in {"resolved", "failed"}:
-                existing = conn.execute(
-                    "SELECT id FROM cases WHERE conversation_id=?",
-                    (conversation_id,),
-                ).fetchone()
-                if existing:
-                    case_id = int(existing["id"])
-                    conn.execute(
-                        "UPDATE cases SET problem=?, solution=?, outcome=?, status=? WHERE id=?",
-                        (row["question"], row["answer"], note, status, case_id),
-                    )
-                    conn.execute(
-                        "DELETE FROM memory_fts WHERE source='case' AND source_id=?",
-                        (case_id,),
-                    )
-                else:
-                    cur = conn.execute(
-                        "INSERT INTO cases(conversation_id, problem, solution, outcome, status) VALUES (?, ?, ?, ?, ?)",
-                        (conversation_id, row["question"], row["answer"], note, status),
-                    )
-                    case_id = int(cur.lastrowid)
-
+            if status not in {"resolved", "failed"}:
+                return
+            existing = conn.execute(
+                "SELECT id FROM cases WHERE conversation_id=?", (conversation_id,)
+            ).fetchone()
+            if existing:
+                case_id = int(existing["id"])
                 conn.execute(
-                    "INSERT INTO memory_fts(source, source_id, title, body) VALUES (?, ?, ?, ?)",
-                    (
-                        "case",
-                        case_id,
-                        row["question"],
-                        f"{row['answer']}\nOutcome: {note}\nStatus: {status}",
-                    ),
+                    "UPDATE cases SET problem=?, solution=?, outcome=?, status=? WHERE id=?",
+                    (row["question"], row["answer"], note, status, case_id),
                 )
+                conn.execute(
+                    "DELETE FROM memory_fts WHERE source='case' AND source_id=?",
+                    (case_id,),
+                )
+            else:
+                cur = conn.execute(
+                    "INSERT INTO cases(conversation_id, problem, solution, outcome, status) VALUES (?, ?, ?, ?, ?)",
+                    (conversation_id, row["question"], row["answer"], note, status),
+                )
+                case_id = int(cur.lastrowid)
+            conn.execute(
+                "INSERT INTO memory_fts(source, source_id, title, body) VALUES (?, ?, ?, ?)",
+                (
+                    "case",
+                    case_id,
+                    row["question"],
+                    f"{row['answer']}\nOutcome: {note}\nStatus: {status}",
+                ),
+            )
 
     @staticmethod
     def _enrich_row(conn, row: dict[str, Any]) -> dict[str, Any] | None:
@@ -357,11 +405,14 @@ class MemoryStore:
                 else 0.72 + 0.18 * float(meta["confidence"])
             )
         elif source == "case":
-            meta = conn.execute("SELECT status FROM cases WHERE id=?", (source_id,)).fetchone()
+            meta = conn.execute(
+                "SELECT status FROM cases WHERE id=?", (source_id,)
+            ).fetchone()
             quality = 1.14 if meta and meta["status"] == "resolved" else 0.88
         elif source == "conversation":
             meta = conn.execute(
-                "SELECT feedback, importance FROM conversations WHERE id=?", (source_id,)
+                "SELECT feedback, importance FROM conversations WHERE id=?",
+                (source_id,),
             ).fetchone()
             if meta:
                 if int(meta["importance"]):
@@ -398,7 +449,7 @@ class MemoryStore:
                 item = self._enrich_row(conn, dict(row))
                 if item is None:
                     continue
-                item["retrieval_score"] = item["memory_quality"] / (60 + index + 1)
+                item["retrieval_score"] = item["memory_quality"] / (61 + index)
                 enriched.append(item)
         enriched.sort(key=lambda item: item["retrieval_score"], reverse=True)
         return enriched[:limit]
