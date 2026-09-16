@@ -7,6 +7,7 @@ from app.db import Database
 from app.llm import MockLLM, PlaywrightGLM
 from app.memory import MemoryStore
 from app.prompt_builder import build_prompt
+from app.reflection import run_reflection
 
 
 class ChatRequest(BaseModel):
@@ -75,6 +76,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         knowledge_id = memory.add_knowledge(payload.rule, payload.confidence, payload.status)
         return {"knowledge_id": knowledge_id}
 
+    @app.post("/api/reflection")
+    async def reflection(limit: int = 50) -> dict:
+        return await run_reflection(memory, llm, max(1, min(limit, 200)))
+
     @app.get("/", response_class=HTMLResponse)
     async def home() -> str:
         return INDEX_HTML
@@ -99,7 +104,7 @@ textarea{min-height:100px}button{padding:10px 14px;margin:8px 6px 0 0;border:0;b
 </head>
 <body>
 <h1>LOCAL_LLM Memory Agent</h1>
-<p class="muted">질문 → 과거 기억 검색 → GLM 프롬프트 자동 조립 → 응답/피드백 저장</p>
+<p class="muted">질문 → 과거 기억 검색 → GLM 프롬프트 자동 조립 → 응답/피드백 저장 → Reflection 지식 생성</p>
 <div class="card">
 <textarea id="q" placeholder="예: Air Dome Zone 3 압력을 올렸는데 C5가 반대로 움직였어. 원인이 뭘까?"></textarea>
 <button class="primary" onclick="ask()">질문하기</button>
@@ -111,6 +116,12 @@ textarea{min-height:100px}button{padding:10px 14px;margin:8px 6px 0 0;border:0;b
 <button onclick="feedback('resolved')">✓ 해결됨</button>
 <button onclick="feedback('failed')">✕ 실패</button>
 <button onclick="feedback('important')">★ 중요지식</button>
+</div>
+<div class="card">
+<h3>자기개선 Reflection</h3>
+<p class="muted">누적된 해결/실패 case를 GLM이 다시 비교해 재사용 가능한 knowledge candidate를 만듭니다.</p>
+<button onclick="reflectNow()">Reflection 실행</button>
+<div id="reflection" class="answer"></div>
 </div>
 <script>
 let currentId=null;
@@ -126,6 +137,11 @@ async function feedback(status){
   if(!currentId)return; const note=document.getElementById('note').value;
   const r=await fetch('/api/feedback/'+currentId,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status,note})});
   if(r.ok) alert('저장되었습니다: '+status); else alert('저장 실패');
+}
+async function reflectNow(){
+  const box=document.getElementById('reflection'); box.textContent='분석 중...';
+  const r=await fetch('/api/reflection',{method:'POST'}); const d=await r.json();
+  box.textContent='분석 case: '+d.case_count+'개 / 생성 knowledge: '+d.created.length+'개\n'+d.created.map(x=>'• '+x.rule+' (confidence '+x.confidence+')').join('\n');
 }
 </script>
 </body>
