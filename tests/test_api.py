@@ -4,7 +4,7 @@ from app.config import Settings
 from app.main import create_app
 
 
-def test_chat_feedback_and_retrieval(tmp_path):
+def test_chat_feedback_retrieval_and_reflection(tmp_path):
     cfg = Settings(db_path=str(tmp_path / "api.db"), glm_mode="mock", top_k_context=5)
     client = TestClient(create_app(cfg))
 
@@ -25,6 +25,16 @@ def test_chat_feedback_and_retrieval(tmp_path):
     second_data = second.json()
     assert second_data["memory_hits"]
     assert any(item["source"] in {"conversation", "case"} for item in second_data["memory_hits"])
+
+    reflection = client.post("/api/reflection")
+    assert reflection.status_code == 200
+    reflection_data = reflection.json()
+    assert reflection_data["case_count"] == 1
+    assert len(reflection_data["created"]) == 1
+
+    knowledge_search = client.get("/api/memory/search", params={"q": "실제 해결 실패 결과"})
+    assert knowledge_search.status_code == 200
+    assert any(item["source"] == "knowledge" for item in knowledge_search.json()["items"])
 
     health = client.get("/health")
     assert health.status_code == 200
