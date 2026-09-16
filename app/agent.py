@@ -26,7 +26,6 @@ def parse_action(raw: str) -> Action:
     try:
         action = Action.model_validate_json(text)
     except ValueError:
-        # Gemini occasionally emits a Windows path with a single backslash.
         import re
         repaired = re.sub(r'\\(?!["\\/bfnrtu])', '/', text)
         action = Action.model_validate_json(repaired)
@@ -37,7 +36,10 @@ def parse_action(raw: str) -> Action:
 
 
 class Agent:
-    MUTATING_TOOLS = {'write_file', 'write_report', 'create_directory', 'run_command', 'git_commit'}
+    MUTATING_TOOLS = {
+        'write_file', 'write_report', 'create_directory', 'run_command',
+        'git_commit', 'save_skill'
+    }
 
     @staticmethod
     def error_category(exc):
@@ -48,6 +50,7 @@ class Agent:
         if isinstance(exc, subprocess.TimeoutExpired):
             return 'command_timeout'
         return 'runtime'
+
     def __init__(self, cfg, memory, retriever, llm):
         self.cfg, self.memory, self.retriever, self.llm = cfg, memory, retriever, llm
         self.root = Path(cfg.agent_workspace).resolve()

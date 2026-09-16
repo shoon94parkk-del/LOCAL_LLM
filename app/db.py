@@ -35,6 +35,27 @@ CREATE TABLE IF NOT EXISTS knowledge (
     status TEXT NOT NULL DEFAULT 'candidate'
 );
 
+CREATE TABLE IF NOT EXISTS knowledge_evidence (
+    knowledge_id INTEGER NOT NULL,
+    case_id INTEGER NOT NULL,
+    relation TEXT NOT NULL DEFAULT 'supports',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (knowledge_id, case_id, relation)
+);
+
+CREATE TABLE IF NOT EXISTS knowledge_relations (
+    source_id INTEGER NOT NULL,
+    target_id INTEGER NOT NULL,
+    relation TEXT NOT NULL,
+    detail TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (source_id, target_id, relation)
+);
+
+CREATE INDEX IF NOT EXISTS idx_knowledge_status ON knowledge(status);
+CREATE INDEX IF NOT EXISTS idx_knowledge_evidence_case ON knowledge_evidence(case_id);
+CREATE INDEX IF NOT EXISTS idx_knowledge_relations_target ON knowledge_relations(target_id);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
     source,
     source_id UNINDEXED,
