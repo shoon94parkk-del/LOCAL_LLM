@@ -67,6 +67,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not secrets.compare_digest(token or '', cfg.browser_bridge_token):
             raise HTTPException(403, '브라우저 연결 토큰이 올바르지 않습니다')
 
+    @app.get('/api/browser/status')
+    async def browser_status(x_bridge_token: str | None = Header(default=None)):
+        bridge_auth(x_bridge_token)
+        return {'connected_mode': True, 'pending': llm.pending is not None, 'job_id': llm.pending['id'] if llm.pending else None}
+
     @app.get('/api/browser/pending')
     async def browser_pending(x_bridge_token: str | None = Header(default=None)):
         bridge_auth(x_bridge_token)
