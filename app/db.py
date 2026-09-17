@@ -68,11 +68,30 @@ CREATE TABLE IF NOT EXISTS session_messages (
     FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS documents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    path TEXT NOT NULL UNIQUE,
+    digest TEXT NOT NULL,
+    size INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS document_chunks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    document_id INTEGER NOT NULL,
+    chunk_index INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    FOREIGN KEY(document_id) REFERENCES documents(id) ON DELETE CASCADE,
+    UNIQUE(document_id, chunk_index)
+);
+
 CREATE INDEX IF NOT EXISTS idx_knowledge_status ON knowledge(status);
 CREATE INDEX IF NOT EXISTS idx_knowledge_evidence_case ON knowledge_evidence(case_id);
 CREATE INDEX IF NOT EXISTS idx_knowledge_relations_target ON knowledge_relations(target_id);
 CREATE INDEX IF NOT EXISTS idx_session_messages_session ON session_messages(session_id, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at);
+CREATE INDEX IF NOT EXISTS idx_document_chunks_document ON document_chunks(document_id, chunk_index);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
     source,
