@@ -52,9 +52,27 @@ CREATE TABLE IF NOT EXISTS knowledge_relations (
     PRIMARY KEY (source_id, target_id, relation)
 );
 
+CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS session_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+);
+
 CREATE INDEX IF NOT EXISTS idx_knowledge_status ON knowledge(status);
 CREATE INDEX IF NOT EXISTS idx_knowledge_evidence_case ON knowledge_evidence(case_id);
 CREATE INDEX IF NOT EXISTS idx_knowledge_relations_target ON knowledge_relations(target_id);
+CREATE INDEX IF NOT EXISTS idx_session_messages_session ON session_messages(session_id, id);
+CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
     source,
@@ -76,6 +94,7 @@ class Database:
     def connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self.path)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
         try:
             yield conn
             conn.commit()
