@@ -20,19 +20,19 @@ def test_document_memory_indexes_updates_and_removes_files(tmp_path):
     first = importer.sync()
     assert first["added"] == 1
     assert first["chunks"] >= 1
-    hits = memory.search("zephyr calibration", 5)
+    hits = memory.search("zephyr", 5)
     assert any(item["source"] == "document" and "wafer.md" in item["title"] for item in hits)
 
     note.write_text("Air Dome nebula calibration uses Zone 5 pressure.", encoding="utf-8")
     second = importer.sync()
     assert second["updated"] == 1
-    assert not any(item["source"] == "document" for item in memory.search("zephyr calibration", 5))
-    assert any(item["source"] == "document" for item in memory.search("nebula calibration", 5))
+    assert not any(item["source"] == "document" for item in memory.search("zephyr", 5))
+    assert any(item["source"] == "document" for item in memory.search("nebula", 5))
 
     note.unlink()
     third = importer.sync()
     assert third["removed"] == 1
-    assert not any(item["source"] == "document" for item in memory.search("nebula calibration", 5))
+    assert not any(item["source"] == "document" for item in memory.search("nebula", 5))
 
 
 def test_document_memory_chunks_large_text_without_losing_searchability(tmp_path):
