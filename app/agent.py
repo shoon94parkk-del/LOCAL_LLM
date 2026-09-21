@@ -4,6 +4,7 @@ import uuid
 import hashlib
 import shlex
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from pydantic import BaseModel, Field
 from app.skills import SkillStore
@@ -11,6 +12,10 @@ from app.skills import SkillStore
 
 MAX_TEXT_CHARS = 240_000
 MAX_TOOL_RESULT_CHARS = 240_000
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 class Action(BaseModel):
@@ -55,16 +60,37 @@ class Agent:
             return 'command_timeout'
         return 'runtime'
 
-    def __init__(self, cfg, memory, retriever, llm):
+    def __init__(self, cfg, memory, retriever, llm, sessions=None):
         self.cfg, self.memory, self.retriever, self.llm = cfg, memory, retriever, llm
+        self.sessions = sessions
         self.root = Path(cfg.agent_workspace).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.allowed_roots = [self.root] + [Path(p).resolve() for p in cfg.agent_allowed_roots]
         self.skills = SkillStore(cfg.skills_dir)
         with memory.db.connect() as conn:
             conn.execute('CREATE TABLE IF NOT EXISTS agent_runs (id TEXT PRIMARY KEY, payload TEXT NOT NULL)')
+        self._recover_interrupted_runs()
+
+    def _recover_interrupted_runs(self):
+        with self.memory.db.connect() as conn:
+            rows = conn.execute('SELECT id, payload FROM agent_runs').fetchall()
+            for row in rows:
+                try:
+                    run = json.loads(row['payload'])
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if run.get('status') == 'running':
+                    run['status'] = 'interrupted'
+                    run['interrupted_at'] = utc_now()
+                    run['updated_at'] = utc_now()
+                    conn.execute(
+                        'UPDATE agent_runs SET payload=? WHERE id=?',
+                        (json.dumps(run, ensure_ascii=False), row['id']),
+                    )
 
     def save(self, run):
+        run.setdefault('created_at', utc_now())
+        run['updated_at'] = utc_now()
         with self.memory.db.connect() as conn:
             conn.execute('INSERT OR REPLACE INTO agent_runs VALUES (?,?)', (run['id'], json.dumps(run, ensure_ascii=False)))
 
@@ -163,9 +189,33 @@ class Agent:
             return {'returncode': completed.returncode, 'stdout': completed.stdout[-12000:], 'stderr': completed.stderr[-4000:], 'verified': completed.returncode == 0}
         return await asyncio.to_thread(call)
 
-    async def run(self, goal, skill=None, existing=None):
+    async def run(self, goal, skill=None, existing=None, session_id=None):
         skill_text = self.skills.read(skill) if skill else ""
-        run = existing or {'id': uuid.uuid4().hex, 'goal': goal, 'status': 'running', 'steps': [], 'answer': ''}
+        session_context = []
+        if existing is None and self.sessions is not None:
+            if session_id is None:
+                session_id = self.sessions.create(goal[:80])["id"]
+            else:
+                self.sessions.get(session_id)
+            session_context = self.sessions.context(session_id)
+            self.sessions.add_message(session_id, 'user', goal)
+        elif existing is not None:
+            session_id = existing.get('session_id') or session_id
+            if self.sessions is not None and session_id:
+                session_context = self.sessions.context(session_id)
+                if session_context and session_context[-1].get('role') == 'user' and session_context[-1].get('content') == goal:
+                    session_context = session_context[:-1]
+
+        run = existing or {
+            'id': uuid.uuid4().hex,
+            'goal': goal,
+            'status': 'running',
+            'steps': [],
+            'answer': '',
+            'session_id': session_id,
+        }
+        if session_id and not run.get('session_id'):
+            run['session_id'] = session_id
         self.save(run)
         instruction = '''[AGENT_REQUEST]
 목표를 해결하기 위해 계획하고 도구 결과를 검토하며 다음 행동을 정하세요.
@@ -181,6 +231,8 @@ class Agent:
         instruction += '\n[허용 폴더]\n' + json.dumps([str(p) for p in self.allowed_roots], ensure_ascii=False)
         instruction += '\n[설치된 skills]\n' + json.dumps(self.skills.list(), ensure_ascii=False)
         instruction += '\n[선택된 skill]\n' + skill_text + '\n'
+        if session_context:
+            instruction += '\n[현재 Session 최근 대화]\n' + json.dumps(session_context, ensure_ascii=False) + '\n'
         try:
             seen_actions = {}
             for _ in range(max(1, min(self.cfg.agent_max_steps, 20))):
@@ -198,6 +250,9 @@ class Agent:
                             raise ValueError('finish에는 answer가 필요합니다')
                         run.update(status='completed', answer=answer)
                         run['conversation_id'] = self.memory.add_conversation(goal, answer)
+                        if self.sessions is not None and session_id and not run.get('session_answer_recorded'):
+                            self.sessions.add_message(session_id, 'assistant', answer)
+                            run['session_answer_recorded'] = True
                         break
                     if action.tool in self.MUTATING_TOOLS and self.cfg.agent_require_approval and not run.get('approved_action'):
                         run.update(status='awaiting_approval', pending_action=action.model_dump())
@@ -230,7 +285,7 @@ class Agent:
 
     async def resume(self, run_id, approve=True):
         run = self.get(run_id)
-        if run.get('status') not in {'awaiting_approval', 'failed', 'cancelled', 'step_limit'}:
+        if run.get('status') not in {'awaiting_approval', 'failed', 'cancelled', 'step_limit', 'interrupted'}:
             raise ValueError('재개할 수 없는 실행 상태입니다')
         if run.get('pending_action') and approve:
             pending = Action.model_validate(run.pop('pending_action'))
@@ -242,4 +297,4 @@ class Agent:
             return run
         run['status'] = 'running'
         self.save(run)
-        return await self.run(run['goal'], existing=run)
+        return await self.run(run['goal'], existing=run, session_id=run.get('session_id'))

@@ -2,6 +2,7 @@ import asyncio
 import json
 import secrets
 import subprocess
+from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException, Response
 from fastapi.responses import HTMLResponse
@@ -10,12 +11,14 @@ from pydantic import BaseModel, Field
 from app.agent import Agent
 from app.config import Settings, settings as default_settings
 from app.db import Database
+from app.document_memory import DocumentMemory
 from app.embeddings import HybridRetriever, LocalEmbeddings
 from app.llm import MockLLM, PlaywrightGLM, SeleniumGLM
 from app.llm.browser_bridge import BrowserBridge
 from app.memory import MemoryStore
 from app.prompt_builder import build_prompt
 from app.reflection import run_reflection
+from app.sessions import SessionStore
 from app.web_ui import INDEX_HTML
 
 
@@ -25,6 +28,11 @@ class ChatRequest(BaseModel):
 
 class AgentRequest(ChatRequest):
     skill: str | None = None
+    session_id: str | None = None
+
+
+class SessionCreateRequest(BaseModel):
+    title: str = Field(default="새 작업", max_length=200)
 
 
 class BridgeResponse(BaseModel):
@@ -48,6 +56,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     cfg.ensure_paths()
     db = Database(cfg.db_path)
     memory = MemoryStore(db)
+    sessions = SessionStore(db)
+    document_memory = DocumentMemory(db, Path(cfg.agent_workspace) / "memory")
+    initial_memory_sync = document_memory.sync()
 
     if cfg.glm_mode not in {"mock", "playwright", "selenium", "browser_bridge"}:
         raise ValueError("Unknown GLM mode")
@@ -78,10 +89,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise ValueError("브라우저 연결 토큰 설정이 필요합니다")
         llm = BrowserBridge(cfg, cfg.glm_timeout_ms / 1000)
 
-    agent = Agent(cfg, memory, retriever, llm)
+    agent = Agent(cfg, memory, retriever, llm, sessions=sessions)
     app = FastAPI(title=cfg.app_name)
     app.state.settings = cfg
     app.state.memory = memory
+    app.state.sessions = sessions
+    app.state.document_memory = document_memory
+    app.state.initial_memory_sync = initial_memory_sync
     app.state.llm = llm
 
     def bridge_auth(token: str | None) -> None:
@@ -125,12 +139,41 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "db_path": cfg.db_path,
             "approval_required": cfg.agent_require_approval,
             "agent_max_steps": cfg.agent_max_steps,
+            "memory_folder": str(document_memory.root),
         }
+
+    @app.post("/api/sessions")
+    async def create_session(payload: SessionCreateRequest) -> dict:
+        return sessions.create(payload.title)
+
+    @app.get("/api/sessions")
+    async def list_sessions(limit: int = 30) -> dict:
+        return {"items": sessions.list(max(1, min(limit, 100)))}
+
+    @app.get("/api/sessions/{session_id}")
+    async def get_session(session_id: str) -> dict:
+        try:
+            result = sessions.get(session_id)
+        except KeyError:
+            raise HTTPException(404, "session not found")
+        with db.connect() as conn:
+            rows = conn.execute("SELECT payload FROM agent_runs ORDER BY rowid ASC").fetchall()
+        runs = []
+        for row in rows:
+            try:
+                run = json.loads(row["payload"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if run.get("session_id") == session_id:
+                runs.append(run)
+        result["runs"] = runs
+        return result
 
     @app.post("/api/chat")
     async def chat(payload: ChatRequest) -> dict:
         """Compatibility endpoint. The primary UI now routes requests through the agent."""
         try:
+            await asyncio.to_thread(document_memory.sync)
             memories = await asyncio.to_thread(
                 retriever.search, payload.question, cfg.top_k_context
             )
@@ -154,6 +197,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         return {"ok": True}
+
+    @app.post("/api/memory/import")
+    async def memory_import() -> dict:
+        return await asyncio.to_thread(document_memory.sync)
 
     @app.get("/api/memory/search")
     async def memory_search(q: str, limit: int = 5) -> dict:
@@ -181,7 +228,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/api/agent/run")
     async def agent_run(payload: AgentRequest) -> dict:
         try:
-            return await agent.run(payload.question, payload.skill)
+            await asyncio.to_thread(document_memory.sync)
+            return await agent.run(payload.question, payload.skill, session_id=payload.session_id)
+        except KeyError:
+            raise HTTPException(404, "session not found")
         except ValueError as exc:
             raise HTTPException(400, str(exc))
 
