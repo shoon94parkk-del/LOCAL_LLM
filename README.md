@@ -2,6 +2,10 @@
 
 사내에서 API 없이 웹사이트 형태로만 사용할 수 있는 LLM을 Selenium/Playwright/Browser Bridge와 SQLite Memory 앞단으로 감싸서, 사용할수록 과거 대화·사례·검증 지식을 재활용하는 로컬 엔지니어링 에이전트입니다.
 
+## 개발 전 필수 문서
+
+이 프로젝트는 사내 제약·승인·Memory 규칙을 보존해야 합니다. 코드 변경 전 `AGENTS.md`, `docs/project-memory.md`, `docs/regression-guardrails.md`, `docs/decision-log.md`를 먼저 확인하고, 행동 변경은 회귀 테스트와 결정 로그를 함께 갱신합니다.
+
 ## 현재 기능
 
 - Chat-first Agent UI
